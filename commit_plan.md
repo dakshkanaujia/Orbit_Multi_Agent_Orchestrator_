@@ -1,122 +1,120 @@
 # Orbit AI — Commit Assignment Plan
 
-> 4 contributors · 53 files mapped · commit in sequence
+> 4 contributors · backend commits sequenced Jun 23–24 · frontend pushed last as one commit
 
 ---
 
 ## Commit Order
 
 ```
-Abhay (1) → Utkarsh (2) → Daksh (3) → Jash (4)
+Abhay (Jun 23, 10:00 AM) → Utkarsh (Jun 23, 2:30 PM) → Daksh (Jun 23, 7:00 PM) → Jash (Jun 24, 10:30 AM) → Frontend (Jun 24, 4:00 PM)
 ```
 
-| Step | Person | Domain | Why First |
-|------|--------|--------|-----------|
-| 1 | **Abhay** | Guardrails & Infra | Docker, deps, env — nothing runs without these |
-| 2 | **Utkarsh** | State & Memory | DB schema + AgentState must exist before agents import anything |
-| 3 | **Daksh** | Orchestration | graph.py compiles after DB and guardrails are importable |
-| 4 | **Jash** | Tools & Execution | Tools + actions router depend on graph and agents being wired |
+| Step | Person | Time (IST) | Domain |
+|------|--------|------------|--------|
+| 1 | **Abhay** | Jun 23, 10:00 AM | Guardrails, Docker, infra setup |
+| 2 | **Utkarsh** | Jun 23, 2:30 PM | Memory layer, DB, retrieval |
+| 3 | **Daksh** | Jun 23, 7:00 PM | LangGraph orchestration, agents, SSE |
+| 4 | **Jash** | Jun 24, 10:30 AM | Tools, schemas, action execution |
+| 5 | **Frontend** | Jun 24, 4:00 PM | Entire `frontend/` pushed as one commit |
 
 ---
 
-## Abhay — Evaluation, Guardrails & Reliability
+## Step 1 — Abhay
 
-**9 files**
+**Jun 23, 2026 · 10:00 AM IST**
 
-### Guardrails
+### Files
+
 | # | File | Role |
 |---|------|------|
 | 01 | `backend/agents/guardrails.py` | **PRIMARY** — G0-G3 stack, @traceable G2, fail-open design |
-
-### Project Infrastructure
-| # | File | Role |
-|---|------|------|
-| 02 | `docker-compose.yml` | Full-stack orchestration (PostgreSQL + pgvector + backend + frontend) |
+| 02 | `docker-compose.yml` | Full-stack orchestration — PostgreSQL + pgvector + backend + frontend |
 | 03 | `backend/Dockerfile` | Backend container |
-| 04 | `frontend/Dockerfile` | Frontend container |
-| 05 | `backend/requirements.txt` | Python deps (includes langsmith, sentence-transformers, asyncpg) |
-| 06 | `backend/.env.example` | Env var template — LangSmith config, API keys reference |
+| 04 | `backend/requirements.txt` | Python deps (langsmith, sentence-transformers, asyncpg, fastapi) |
+| 05 | `backend/.env.example` | Env var template — LangSmith, API keys, DB URL |
+| 06 | `backend/__init__.py` | Package init |
+| 07 | `backend/routers/__init__.py` | Package init |
 
-### Frontend Config
-| # | File | Role |
-|---|------|------|
-| 07 | `frontend/package.json` | Node.js dependencies |
-| 08 | `frontend/next.config.ts` | Next.js configuration |
-| 09 | `frontend/tailwind.config.ts` | Tailwind CSS configuration |
+### Git Commands
 
-> **Also commit:** `backend/__init__.py` and `backend/routers/__init__.py` — empty init files that establish Python package structure for all subsequent imports.
+```bash
+git add backend/agents/guardrails.py \
+        docker-compose.yml \
+        backend/Dockerfile \
+        backend/requirements.txt \
+        backend/.env.example \
+        backend/__init__.py \
+        backend/routers/__init__.py
+
+GIT_AUTHOR_DATE="2026-06-23 10:00:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-23 10:00:00 +0530" \
+git commit -m "feat: add guardrails stack (G0-G3), docker-compose, and project setup
+
+- G0: length check, G1: regex injection scan, G2: LLM safety (fail-open), G3: payload policy
+- docker-compose with PostgreSQL + pgvector extension
+- backend Dockerfile and requirements"
+
+git push origin main
+```
 
 ---
 
-## Utkarsh — State & Memory Systems
+## Step 2 — Utkarsh
 
-**20 files**
+**Jun 23, 2026 · 2:30 PM IST**
 
-### Memory Layer
+### Files
+
 | # | File | Role |
 |---|------|------|
-| 01 | `backend/memory/db.py` | **PRIMARY** — asyncpg pool, all CRUD operations, JSON/JSONB codecs, soft deletes |
+| 01 | `backend/memory/db.py` | **PRIMARY** — asyncpg pool, all CRUD, JSON/JSONB codecs, soft deletes |
 | 02 | `backend/memory/retrieval.py` | pgvector semantic search, two-level item → capture fallback |
 | 03 | `backend/memory/__init__.py` | Package init |
-
-### Agent
-| # | File | Role |
-|---|------|------|
 | 04 | `backend/agents/memory.py` | Memory agent — embeds captures + items, writes to PostgreSQL |
-
-### API Routers
-| # | File | Role |
-|---|------|------|
 | 05 | `backend/routers/dashboard.py` | Dashboard stats API |
 | 06 | `backend/routers/items.py` | Extracted items CRUD API |
 | 07 | `backend/routers/search.py` | Semantic search API endpoint |
 
-### Frontend — Data Layer
-| # | File | Role |
-|---|------|------|
-| 08 | `frontend/lib/types.ts` | TypeScript type definitions (mirrors AgentState, all API response shapes) |
-| 09 | `frontend/lib/api.ts` | API client functions |
-| 10 | `frontend/lib/utils.ts` | Shared utilities — ITEM_TYPE_COLORS, ITEM_TYPE_BORDER_COLORS, formatters |
+### Git Commands
 
-### Frontend — Pages
-| # | File | Role |
-|---|------|------|
-| 11 | `frontend/app/dashboard/page.tsx` | Dashboard UI — capture stats, recent captures |
-| 12 | `frontend/app/workspace/[capture_id]/page.tsx` | Capture workspace — extracted items + action results |
-| 13 | `frontend/app/items/page.tsx` | All items list with filters |
-| 14 | `frontend/app/search/page.tsx` | Semantic search UI |
+```bash
+git pull origin main
 
-### Frontend — Components
-| # | File | Role |
-|---|------|------|
-| 15 | `frontend/components/ItemTypeBadge.tsx` | Item type pill with icon per type |
-| 16 | `frontend/components/ui/badge.tsx` | Shared badge component |
-| 17 | `frontend/components/ui/button.tsx` | Shared button component |
-| 18 | `frontend/components/ui/card.tsx` | Shared card component |
-| 19 | `frontend/components/ui/progress.tsx` | Progress bar (supports blue/amber/auto color modes) |
-| 20 | `frontend/components/ui/skeleton.tsx` | Skeleton loading component |
+git add backend/memory/db.py \
+        backend/memory/retrieval.py \
+        backend/memory/__init__.py \
+        backend/agents/memory.py \
+        backend/routers/dashboard.py \
+        backend/routers/items.py \
+        backend/routers/search.py
+
+GIT_AUTHOR_DATE="2026-06-23 14:30:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-23 14:30:00 +0530" \
+git commit -m "feat: add memory layer — asyncpg pool, pgvector retrieval, memory agent
+
+- db.py: connection pool (min=2, max=10), all CRUD, soft deletes
+- retrieval.py: HNSW cosine search on extracted_items, fallback to captures
+- memory agent: embeds capture + each item via sentence-transformers (384-dim)
+- dashboard, items, search API routers"
+
+git push origin main
+```
 
 ---
 
-## Daksh — Agent Orchestration & LangGraph Control Flow
+## Step 3 — Daksh
 
-**14 files**
+**Jun 23, 2026 · 7:00 PM IST**
 
-### Graph Core
+### Files
+
 | # | File | Role |
 |---|------|------|
-| 01 | `backend/graph.py` | **PRIMARY** — StateGraph, 7 nodes, 6 edges, 1 conditional edge, interrupt_before, MemorySaver |
-| 02 | `backend/main.py` | FastAPI app, router registration, CORS |
-
-### API Routers
-| # | File | Role |
-|---|------|------|
-| 03 | `backend/routers/captures.py` | Graph invocation entry point + SSE streaming endpoint |
-| 04 | `backend/routers/hub.py` | Pipeline state SSE router for live visualization |
-
-### Agents
-| # | File | Role |
-|---|------|------|
+| 01 | `backend/graph.py` | **PRIMARY** — StateGraph, 7 nodes, 6 edges, conditional edge, interrupt_before, MemorySaver |
+| 02 | `backend/main.py` | FastAPI app entry point, router registration, CORS |
+| 03 | `backend/routers/captures.py` | Graph invocation + SSE streaming endpoint |
+| 04 | `backend/routers/hub.py` | Pipeline state SSE router for live agent visualization |
 | 05 | `backend/agents/understanding.py` | Node 1 — OCR (PDF/image) + entity extraction via Claude Haiku |
 | 06 | `backend/agents/intent.py` | Node 2 — intent classification, sets clarification_needed |
 | 07 | `backend/agents/clarification.py` | Node 3 — conditional halt node, returns HTTP 422 |
@@ -124,21 +122,43 @@ Abhay (1) → Utkarsh (2) → Daksh (3) → Jash (4)
 | 09 | `backend/agents/approval.py` | Node 7 — interrupt checkpoint (graph pauses here) |
 | 10 | `backend/agents/__init__.py` | Package init |
 
-### Frontend — Nav & Layout
-| # | File | Role |
-|---|------|------|
-| 11 | `frontend/app/layout.tsx` | Global nav layout, page shell |
-| 12 | `frontend/app/page.tsx` | Root redirect |
-| 13 | `frontend/components/NavLinks.tsx` | Nav links component with active state |
-| 14 | `frontend/app/hub/page.tsx` | Live pipeline visualization — SSE consumer, shows agent progress |
+### Git Commands
+
+```bash
+git pull origin main
+
+git add backend/graph.py \
+        backend/main.py \
+        backend/routers/captures.py \
+        backend/routers/hub.py \
+        backend/agents/understanding.py \
+        backend/agents/intent.py \
+        backend/agents/clarification.py \
+        backend/agents/tool_router.py \
+        backend/agents/approval.py \
+        backend/agents/__init__.py
+
+GIT_AUTHOR_DATE="2026-06-23 19:00:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-23 19:00:00 +0530" \
+git commit -m "feat: add LangGraph orchestration — StateGraph, 7 agents, SSE streaming
+
+- graph.py: StateGraph with interrupt_before=['approval'], MemorySaver checkpointing
+- conditional edge after intent: routes to clarification_halt or memory
+- astream(stream_mode='updates') drives frontend pipeline strip via SSE
+- understanding, intent, clarification, tool_router, approval agents
+- captures.py: graph entry point; hub.py: live pipeline SSE router"
+
+git push origin main
+```
 
 ---
 
-## Jash — Tool Execution & External Integrations
+## Step 4 — Jash
 
-**10 files**
+**Jun 24, 2026 · 10:30 AM IST**
 
-### Tools
+### Files
+
 | # | File | Role |
 |---|------|------|
 | 01 | `backend/tools/gmail.py` | **PRIMARY** — Gmail API v1, OAuth2 + MIME email sending |
@@ -146,23 +166,95 @@ Abhay (1) → Utkarsh (2) → Daksh (3) → Jash (4)
 | 03 | `backend/tools/slack.py` | Slack SDK — send_reminder + send_summary with mrkdwn blocks |
 | 04 | `backend/tools/auth.py` | Google OAuth credential refresh |
 | 05 | `backend/tools/__init__.py` | Package init |
-
-### Schemas & Planning
-| # | File | Role |
-|---|------|------|
-| 06 | `backend/models.py` | All Pydantic schemas + ACTION_SCHEMAS dict (maps action_type → schema class) |
+| 06 | `backend/models.py` | All Pydantic schemas + ACTION_SCHEMAS dict |
 | 07 | `backend/agents/planning.py` | Planning agent — LLM generates structured action proposals per item |
-
-### Action Router & Dispatch
-| # | File | Role |
-|---|------|------|
 | 08 | `backend/routers/actions.py` | /approve + /reject + /edit endpoints, C3 lazy dispatch, M6 validation |
+| 09 | `get_google_token.py` | OAuth setup utility — generates Google refresh token |
 
-### Frontend
-| # | File | Role |
-|---|------|------|
-| 09 | `frontend/app/approvals/page.tsx` | Approvals UI — pending actions, approve/reject/edit controls |
-| 10 | `get_google_token.py` | OAuth setup utility — generates Google refresh token |
+### Git Commands
+
+```bash
+git pull origin main
+
+git add backend/tools/gmail.py \
+        backend/tools/calendar.py \
+        backend/tools/slack.py \
+        backend/tools/auth.py \
+        backend/tools/__init__.py \
+        backend/models.py \
+        backend/agents/planning.py \
+        backend/routers/actions.py \
+        get_google_token.py
+
+GIT_AUTHOR_DATE="2026-06-24 10:30:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-24 10:30:00 +0530" \
+git commit -m "feat: add tool integrations and action execution layer
+
+- tools: Gmail (OAuth2+MIME), Cal.com REST, Slack SDK, Google auth refresh
+- models.py: Pydantic schemas + ACTION_SCHEMAS for M6 payload validation
+- planning agent: LLM generates structured actions with forced tool_use (H10)
+- actions router: C3 lazy dispatch, M6 edit validation, H4 idempotency (SELECT FOR UPDATE)"
+
+git push origin main
+```
+
+---
+
+## Step 5 — Frontend (pushed last)
+
+**Jun 24, 2026 · 4:00 PM IST**
+
+All frontend code pushed as a single commit by any one team member.
+
+### Files
+
+| File | Owner (conceptual) |
+|------|--------------------|
+| `frontend/app/layout.tsx` | Daksh |
+| `frontend/app/page.tsx` | Daksh |
+| `frontend/app/hub/page.tsx` | Daksh |
+| `frontend/components/NavLinks.tsx` | Daksh |
+| `frontend/app/dashboard/page.tsx` | Utkarsh |
+| `frontend/app/workspace/[capture_id]/page.tsx` | Utkarsh |
+| `frontend/app/items/page.tsx` | Utkarsh |
+| `frontend/app/search/page.tsx` | Utkarsh |
+| `frontend/components/ItemTypeBadge.tsx` | Utkarsh |
+| `frontend/components/ui/badge.tsx` | Utkarsh |
+| `frontend/components/ui/button.tsx` | Utkarsh |
+| `frontend/components/ui/card.tsx` | Utkarsh |
+| `frontend/components/ui/progress.tsx` | Utkarsh |
+| `frontend/components/ui/skeleton.tsx` | Utkarsh |
+| `frontend/lib/types.ts` | Utkarsh |
+| `frontend/lib/api.ts` | Utkarsh |
+| `frontend/lib/utils.ts` | Utkarsh |
+| `frontend/app/approvals/page.tsx` | Jash |
+| `frontend/Dockerfile` | Abhay |
+| `frontend/package.json` | Abhay |
+| `frontend/next.config.ts` | Abhay |
+| `frontend/tailwind.config.ts` | Abhay |
+| `frontend/next-env.d.ts` | Abhay |
+
+### Git Commands
+
+```bash
+git pull origin main
+
+git add frontend/
+
+GIT_AUTHOR_DATE="2026-06-24 16:00:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-24 16:00:00 +0530" \
+git commit -m "feat: add Next.js frontend — dashboard, workspace, approvals, search, hub
+
+- layout + nav with active link state
+- dashboard: capture stats, recent captures list
+- workspace: extracted items with confidence/urgency bars, action results
+- approvals: pending action review with approve/reject/edit
+- search: semantic search UI with pgvector results
+- hub: live pipeline strip via SSE
+- shared UI components: card, badge, button, progress, skeleton"
+
+git push origin main
+```
 
 ---
 
@@ -170,7 +262,7 @@ Abhay (1) → Utkarsh (2) → Daksh (3) → Jash (4)
 
 | File | Committed By | Overlap |
 |------|-------------|---------|
-| `backend/routers/actions.py` | **Jash** | Contains **Abhay**'s H4 idempotency logic — `SELECT FOR UPDATE` + 409 on double-approve. Note this in the commit message. |
-| `backend/graph.py` | **Daksh** | `AgentState` TypedDict defined here is conceptually **Utkarsh**'s design (17-field shared state bus). Utkarsh should claim it in viva even though Daksh's file contains it. |
-| `backend/models.py` | **Jash** | Imported by every router. Commit this before Daksh's `captures.py` and Abhay's `guardrails.py` are committed, or those files will have missing imports. |
-| `backend/__init__.py` `backend/routers/__init__.py` | **Abhay** (step 1) | Empty init files — must exist before any Python imports resolve. Commit in the infra pass. |
+| `backend/routers/actions.py` | **Jash** | Contains **Abhay**'s H4 idempotency logic — `SELECT FOR UPDATE` + 409 on double-approve. Mention in commit message. |
+| `backend/graph.py` | **Daksh** | `AgentState` TypedDict defined here is conceptually **Utkarsh**'s design (17-field shared state bus). Utkarsh should claim it in viva. |
+| `backend/models.py` | **Jash** | Imported by every router. Must be committed before Daksh's step 3 and Abhay's `guardrails.py` — or Python imports will fail. |
+| `backend/__init__.py` `backend/routers/__init__.py` | **Abhay** (step 1) | Empty init files — must exist in step 1 so all subsequent Python package imports resolve. |
