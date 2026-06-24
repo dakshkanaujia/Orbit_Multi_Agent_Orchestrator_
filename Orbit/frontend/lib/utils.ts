@@ -18,6 +18,18 @@ export const ITEM_TYPE_COLORS: Record<ItemType, string> = {
   knowledge: "bg-gray-100 text-gray-800",
 };
 
+export const ITEM_TYPE_BORDER_COLORS: Record<ItemType, string> = {
+  event:           "border-l-blue-400",
+  deadline:        "border-l-red-400",
+  task:            "border-l-yellow-400",
+  communication:   "border-l-purple-400",
+  travel_interest: "border-l-teal-400",
+  job_opportunity: "border-l-green-400",
+  meeting:         "border-l-indigo-400",
+  reminder:        "border-l-orange-400",
+  knowledge:       "border-l-gray-300",
+};
+
 export const ITEM_TYPE_ICON_NAMES: Record<ItemType, string> = {
   event: "Calendar",
   deadline: "Clock",
