@@ -1617,3 +1617,429 @@ async with pool.acquire() as conn:
 4. Verify embedding dimensions: `SELECT array_length(embedding::float[], 1) FROM captures LIMIT 1` should return 384.
 
 ---
+
+---
+
+## 7. CROSS-MODULE QUESTIONS
+
+---
+
+### 7.1 How does Utkarsh's AgentState enable Daksh's routing logic?
+
+Daksh owns the graph orchestrator and conditional routing. The routing function after the intent node reads:
+
+```python
+def route_after_intent(state: AgentState) -> str:
+    if state["clarification_needed"]:
+        return "clarification"
+    return "memory"
+```
+
+The `clarification_needed: bool` field in AgentState is defined by Utkarsh. Without this field, Daksh would have no standardized way to signal a routing branch. If Utkarsh had named it `needs_clarification` or put it inside a nested dict, Daksh's router would need to change.
+
+Additionally, `clarification_reason: str` provides the human-readable message shown to the user when clarification is requested — also defined in AgentState by Utkarsh.
+
+**The contract:** Utkarsh defines the fields; Daksh's routing reads them. This is an explicit design agreement documented in AgentState. If the field names change, both sides must update.
+
+---
+
+### 7.2 How do Utkarsh's extracted_item_ids feed into Jash's planning agent?
+
+After memory_agent completes, `AgentState["extracted_item_ids"]` contains a list of UUIDs — one per extracted item that was inserted to the DB.
+
+Jash's planning agent reads these IDs to:
+1. Query the DB for each item: `await db.get_items_by_capture(capture_id)` — gets items ordered by `urgency_score DESC`.
+2. Generate actions for each item based on `item_type`, `title`, `description`, and `entities`.
+3. Insert actions to the DB: `await db.insert_action(extracted_item_id=item_id, ...)`.
+4. Write `actions` and `pending_action_ids` to AgentState.
+
+Without `extracted_item_ids`, Jash's planning agent would have no DB-linked items to plan for. The IDs are the handoff point between Utkarsh's memory persistence and Jash's planning logic.
+
+**Dependency:** If Utkarsh's H2 assertion fires (item count mismatch), planning never runs — the graph fails at memory_agent. This is intentional: better to fail early than to plan against an inconsistent state.
+
+---
+
+### 7.3 How does Abhay's G3 guardrail interact with Utkarsh's DB writes in planning?
+
+Abhay's G3 guardrail is a validation step that checks planned actions before they're persisted. In the pipeline:
+
+1. Jash's planning agent generates action dicts in state (not yet in DB).
+2. Abhay's tool_router/guardrail validates these actions (G3: checks action_type, payload structure, requires_approval flags).
+3. After G3 validation, tool_router writes approved actions to the DB via `db.insert_action(...)`.
+
+Utkarsh's `insert_action` function in `memory/db.py` is called by tool_router (Abhay's module) — so Utkarsh's DB layer is the persistence point that Abhay's module writes through. If G3 rejects an action, it never reaches `db.insert_action` and never touches the DB. The separation means Utkarsh's DB layer remains clean (only validated actions are stored) because Abhay's guardrail acts as a gate before DB writes.
+
+---
+
+### 7.4 What state fields does Abhay's approval endpoint read from the DB?
+
+When the approval webhook fires (human approves/rejects an action):
+
+1. **`pending_action_ids`** — from AgentState (loaded from MemorySaver via `thread_id`/`run_id`). These are the action IDs awaiting decisions.
+2. **`actions` table** — Abhay queries `db.get_pending_actions()` to get the full action payload (what to display to the human for review).
+3. **`decisions` table** — Abhay calls `db.get_decision_by_action(action_id)` to check if a decision already exists (idempotency guard — don't process the same approval twice).
+
+After the human decides:
+1. Abhay calls `db.insert_decision(action_id=..., decision=..., edited_payload=..., final_payload=...)`.
+2. Calls `db.update_action_status(action_id, "approved")` or `"rejected"`.
+3. Updates `decided_action_ids` in AgentState.
+4. Resumes the LangGraph graph.
+
+Utkarsh's `decisions` table design (partial unique index, `ON DELETE SET NULL`) directly affects how Abhay's approval handler functions.
+
+---
+
+### 7.5 How does the retrieval system support the hub page AI digest?
+
+The hub page shows an "AI digest" — a summary of recent, relevant, and actionable captures. This is powered by `assemble_retrieval_context`.
+
+Flow:
+1. Hub page loads → API endpoint called.
+2. Endpoint calls `assemble_retrieval_context(query="recent important items", max_results=10)`.
+3. Retrieval returns top items by semantic similarity, enriched with parent captures and pending actions.
+4. API also queries `db.list_extracted_items(filters={"planning_status": "pending"})` for items that haven't been actioned yet.
+5. The combined result is passed to an LLM summarization call to generate the digest text.
+6. The digest + raw items are returned to the hub page.
+
+Utkarsh's `update_extracted_item_planning_status` function is what removes items from the hub's "pending" view once they've been planned — creating the "inbox zero" experience.
+
+---
+
+### 7.6 How does MemorySaver interact with Daksh's interrupt_before?
+
+Daksh compiles the graph:
+```python
+graph = graph_builder.compile(
+    checkpointer=MemorySaver(),
+    interrupt_before=["approval"]
+)
+```
+
+When the graph runs and reaches the `approval` node:
+1. LangGraph saves the full AgentState to MemorySaver, keyed by `run_id` (as `thread_id`).
+2. LangGraph returns control to Daksh's API endpoint with a special interrupt response.
+3. Daksh's endpoint stores `run_id` and responds to the client: "approval needed."
+4. Later, Abhay's approval webhook fires. It calls Daksh's resume endpoint with the decision.
+5. Daksh's resume endpoint calls `graph.ainvoke({"decisions": [decision]}, config={"configurable": {"thread_id": run_id}})`.
+6. LangGraph loads the checkpoint from MemorySaver by `run_id`, merges the decision, and continues.
+
+MemorySaver is Utkarsh's architectural responsibility. The `run_id` that keys MemorySaver is defined in AgentState by Utkarsh. The checkpointer selection (MemorySaver vs. a persistent one) determines whether multi-resume works across server restarts — a decision Utkarsh made and should be able to defend.
+
+---
+
+## 8. DEMONSTRATION SCRIPT (3–5 MINUTES)
+
+*Use this script when asked to walk through your module live or in explanation.*
+
+---
+
+### Opening (30 seconds)
+
+"I own the state and memory layer of Orbit — essentially, the system's ability to remember anything. Every piece of information a user captures has to pass through my code: it gets embedded, stored in PostgreSQL, and made searchable by meaning rather than just keywords. Without my layer, Orbit is stateless — each run would start fresh with no memory of past captures."
+
+---
+
+### Step 1: The AgentState contract (45 seconds)
+
+"The foundation is AgentState — a TypedDict that defines 17 fields shared across all 7 agents. It's a contract. Every agent knows that after memory_agent runs, `capture_id` and `extracted_item_ids` will be in state. Before I run, they're absent.
+
+The key fields I write are `capture_id`, `extracted_item_ids`, and a trace entry. I also read `capture`, `extracted_items`, and `run_id` — these are set by the understanding and intent agents before I run."
+
+---
+
+### Step 2: Memory agent execution (90 seconds)
+
+"Here's what happens when a capture arrives. The understanding agent has already set `state['capture']['raw_content']` to the parsed text. My memory agent:
+
+First, embeds that raw content using a local SentenceTransformer model — `all-MiniLM-L6-v2`. This produces a 384-dimensional vector that encodes the semantic meaning of the text.
+
+Second, inserts that capture to PostgreSQL. The `captures` table has a `vector(384)` column powered by pgvector. I generate a UUID in Python before the insert — so I don't need a second round-trip to get the ID.
+
+Third, for each extracted item from the intent agent, I embed `title + description` and insert to `extracted_items`. Each item gets its own vector.
+
+Fourth, I run the H2 assertion: `assert len(item_ids) == len(extracted_items)`. This is a hard invariant — if any insert failed silently, I catch it here rather than letting planning work with a corrupted state.
+
+Finally, I return the updated state with `capture_id`, `extracted_item_ids`, and a trace entry."
+
+---
+
+### Step 3: Semantic retrieval (60 seconds)
+
+"Now that data is in the DB, it's queryable by meaning. If a user later captures something related, the retrieval system finds the connection.
+
+The `assemble_retrieval_context` function takes a query string, embeds it with the same model, and runs this pgvector query: `1 - (embedding <=> query_vector)` — cosine similarity. Results above 0.3 similarity are returned, sorted by score. The HNSW index makes this O(log n) rather than a full table scan.
+
+Level 1 searches extracted_items — specific, high-signal results. Level 2 searches captures as a fallback. Each result is enriched with its parent capture and associated actions. This enriched context goes into `retrieval_context` in AgentState, and planning agents include it in their LLM prompts."
+
+---
+
+### Step 4: Schema design highlight (30 seconds)
+
+"The schema has one notable design: the decisions table uses `ON DELETE SET NULL` and a partial unique index. This means: if an action is deleted, the decision record survives — preserving the audit trail. And the partial index enforces at-most-one decision per action, preventing race conditions during concurrent approval webhooks.
+
+Soft deletes on captures (`deleted_at`) mean no data is ever lost — everything is recoverable."
+
+---
+
+### Closing (15 seconds)
+
+"In summary: my layer transforms ephemeral in-memory state into durable, semantically searchable knowledge. Everything downstream — planning, approval, the hub page digest — depends on the IDs and context I produce."
+
+---
+
+## 9. EXAMINER CHALLENGE SCENARIOS
+
+*For each challenge: state the problem, your answer, and what it reveals about system understanding.*
+
+---
+
+### Challenge 1: "What if the embedding model produces different vectors on re-run?"
+
+**The problem:** If `all-MiniLM-L6-v2` is updated or replaced with a different model, embeddings stored at write time are in a different vector space than embeddings computed at query time. Cosine similarity between old and new vectors is meaningless.
+
+**Your answer:** "This is the embedding drift problem. In Orbit, it's mitigated by pinning the model version in `requirements.txt` — `sentence-transformers==2.x.x`. The model version is locked, so the same code always loads the same weights and produces identical vectors for the same input (deterministic inference).
+
+If we needed to upgrade the model: I'd add an `embedding_model_version TEXT` column to both tables. At write time, store the model version alongside the embedding. At query time, filter to only compare against rows with the same model version. Then run a background migration to re-embed old rows with the new model, updating their version tag. Once all rows are migrated, remove the version filter.
+
+This approach enables zero-downtime model migration with no degradation to retrieval quality during the transition."
+
+**What it reveals:** Understanding of embedding spaces, model versioning, and the practical implications of changing ML components in production.
+
+---
+
+### Challenge 2: "How do you handle a 100-page PDF with 50,000 tokens?"
+
+**The problem:** `all-MiniLM-L6-v2` has a maximum input length of 256 tokens (word-pieces). A 50,000-token document cannot be embedded as a single vector. Also, storing all 50,000 tokens in `raw_content` is unwieldy.
+
+**Your answer:** "Three-part answer.
+
+First, chunking: split the PDF into overlapping chunks of ~200 tokens each (with 50-token overlap to preserve context across chunk boundaries). Each chunk gets its own row in `extracted_items` with its own embedding. The parent capture stores the full file_path (not the raw text). Chunks are linked via `capture_id`.
+
+Second, storage: `raw_content` in the capture stores a summary or the first 2,000 characters. The actual file is stored on disk and referenced via `file_path`. For retrieval, we search chunks rather than the full document.
+
+Third, retrieval: a 100-page PDF produces hundreds of chunks. Retrieval returns the top-K semantically relevant chunks, not the full document. The planning agent sees the relevant sections, not the whole thing.
+
+For Orbit's demo, the understanding agent likely handles PDF extraction via a library like `pdfplumber`, which already chunks by page. Memory_agent would then receive pre-chunked items from the intent agent."
+
+**What it reveals:** Understanding of embedding model limitations, chunking strategies, and how the schema/pipeline handles large inputs.
+
+---
+
+### Challenge 3: "What if asyncpg pool is exhausted under concurrent load?"
+
+**The problem:** With `max_size=10`, the 11th concurrent request blocks waiting for a pool connection. If all 10 connections are held by long-running transactions, new requests wait indefinitely.
+
+**Your answer:** "asyncpg's `pool.acquire()` accepts a `timeout` parameter: `async with pool.acquire(timeout=5.0) as conn`. If no connection is available within 5 seconds, it raises `asyncio.TimeoutError`. The caller catches this and returns a 503 Service Unavailable response.
+
+For prevention: monitor pool utilization (asyncpg exposes `pool.get_size()`, `pool.get_idle_size()`). If idle connections consistently drop to zero, increase `max_size` — but first check whether the bottleneck is the pool or PostgreSQL itself (`max_connections` on the server side).
+
+For production: deploy PgBouncer in transaction pooling mode. The app maintains `max_size=10` connections to PgBouncer, which multiplexes onto fewer PostgreSQL connections. This is transparent to the application code — asyncpg connects to PgBouncer's host/port rather than directly to PostgreSQL.
+
+The root cause is usually slow queries holding connections. Adding `statement_timeout = 10s` at the connection level (`ALTER ROLE orbit SET statement_timeout = '10s'`) prevents any single query from blocking a connection indefinitely."
+
+**What it reveals:** Operational understanding of connection pool management, backpressure, and production database topology.
+
+---
+
+### Challenge 4: "Why store embeddings in PostgreSQL instead of a dedicated vector DB?"
+
+**The problem / challenge premise:** Pinecone, Weaviate, Qdrant are purpose-built for vector search. They offer horizontal scaling, built-in metadata filtering, and multi-tenant namespacing. Why not use one?
+
+**Your answer:** "Four reasons.
+
+One, no extra infrastructure. Orbit already runs PostgreSQL. Adding a vector DB means: another service to deploy, another set of credentials to manage, another point of failure, and another billing account. For a demo/startup, operational simplicity has real value.
+
+Two, transactional consistency. A memory_agent insert can atomically write the capture, all items, and their embeddings in one PostgreSQL transaction. With a separate vector DB, you'd do: insert to SQL, then insert to vector DB. If the vector insert fails after the SQL insert, you have an inconsistency — SQL row with no searchable embedding.
+
+Three, SQL joins. Retrieval queries can join vector search results directly to relational data in the same query. With Pinecone, you get back IDs, then make a second round-trip to PostgreSQL to fetch the actual rows.
+
+Four, scale. At Orbit's demo scale (hundreds to low thousands of rows), HNSW in PostgreSQL performs in single-digit milliseconds. pgvector's performance degrades gracefully — it's at millions of rows where a dedicated vector DB's distributed architecture starts to matter. We'd revisit this decision at 10M+ items.
+
+The tradeoff I'm accepting: if embeddings dominate storage or query volume at massive scale, pgvector may not be the right choice. That's a growth problem I'm consciously deferring."
+
+**What it reveals:** Understanding of operational tradeoffs, not just technical capabilities.
+
+---
+
+### Challenge 5: "Walk through exactly what MemorySaver stores when checkpointing"
+
+**The problem / challenge:** Demonstrate detailed knowledge of LangGraph internals.
+
+**Your answer:** "After each node, LangGraph calls `checkpointer.put(config, checkpoint, metadata)`.
+
+The `config` contains `{"configurable": {"thread_id": run_id}}` — the lookup key.
+
+The `checkpoint` is a dict with:
+- `"v"`: schema version number (e.g., 1)
+- `"id"`: a UUID for this specific checkpoint
+- `"ts"`: ISO timestamp of the checkpoint
+- `"channel_values"`: the full AgentState dict at this moment — all 17 fields. This is the actual state snapshot.
+- `"channel_versions"`: a dict of `{field_name: version_number}` tracking which agent last wrote each field.
+- `"versions_seen"`: used by LangGraph for causality tracking in parallel graphs.
+
+The `metadata` contains: `{"source": "loop", "step": N, "writes": {node_name: {changed_keys}}}`.
+
+MemorySaver stores these in a nested dict: `{thread_id: {checkpoint_id: {checkpoint + metadata}}}`.
+
+When the graph is resumed, LangGraph calls `checkpointer.get(config)` which returns the latest checkpoint by `thread_id`. It restores `channel_values` (the full state), then applies the resume input on top.
+
+The practical implication: if `raw_content` is 50KB, every checkpoint is at least 50KB. With 7 agents = 7 checkpoints per run, a 50KB input costs 350KB of MemorySaver memory. This is why M4 (lightweight trace) matters — keeping non-embedding state small."
+
+**What it reveals:** Deep LangGraph internals knowledge, not just surface-level usage.
+
+---
+
+### Challenge 6: "How would you migrate to Redis checkpointer in production?"
+
+**The problem / challenge:** MemorySaver doesn't survive server restarts. Production needs durability.
+
+**Your answer:** "LangGraph provides `AsyncRedisSaver` in `langgraph-checkpoint-redis`. Migration is a one-line code change plus deployment:
+
+```python
+# Before (development)
+from langgraph.checkpoint.memory import MemorySaver
+checkpointer = MemorySaver()
+
+# After (production)
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+checkpointer = await AsyncRedisSaver.from_conn_string(REDIS_URL)
+await checkpointer.asetup()  # creates required Redis structures
+```
+
+The `graph.compile(checkpointer=checkpointer)` line is unchanged. All agent code is unchanged — nodes never interact with the checkpointer directly.
+
+Operationally: (1) deploy Redis (managed: AWS ElastiCache, Redis Cloud). (2) Set `REDIS_URL` env var. (3) Configure Redis TTL for checkpoint expiry — `checkpointer = AsyncRedisSaver.from_conn_string(url, ttl={"default": 3600})` — 1 hour TTL for checkpoints prevents unbounded Redis growth. (4) For horizontal scaling: all server instances point to the same Redis, so any instance can resume any run.
+
+The tradeoff vs. PostgreSQL checkpointer: Redis is faster (sub-millisecond reads/writes) but less durable (AOF + RDB persistence needed, not transactional). PostgreSQL checkpointer (`AsyncPostgresSaver`) is slower but fully ACID. For a chatbot-scale application where checkpoint speed matters, Redis. For an enterprise workflow platform where durability is critical, PostgreSQL."
+
+**What it reveals:** Production engineering awareness and understanding of checkpointer abstraction.
+
+---
+
+### Challenge 7: "What happens to the state if the memory agent throws an exception?"
+
+**The problem / challenge:** Error handling and state consistency.
+
+**Your answer:** "Let's trace through the exact failure modes.
+
+**Exception before any DB writes** (e.g., embedding fails): No DB state is written. AgentState is unchanged (the `return` statement never executed). LangGraph propagates the exception. MemorySaver retains the checkpoint from before memory_agent ran. The `runs` table has no entry yet (assuming run insertion happens at the end). Clean failure.
+
+**Exception after capture insert, before item inserts** (e.g., first `insert_extracted_item` raises ForeignKeyViolation): The `captures` row exists in DB. `extracted_items` has zero rows for this capture. `capture_id` is NOT written to AgentState (exception prevented return). MemorySaver checkpoint is from before memory_agent. Result: DB has an orphan capture with no items. Not automatically cleaned up.
+
+**Exception from H2 assertion** (count mismatch): Some items were inserted, some weren't. The assertion fires and raises `AssertionError`. Same outcome as above — partial DB state.
+
+**Recovery strategy:** (1) The API endpoint catches the exception and returns 500 with the `run_id`. (2) A cleanup job periodically finds captures with zero items and `deleted_at IS NULL` (orphans) and soft-deletes them. (3) For strict atomicity, wrap all DB operations in a transaction — if anything fails, the entire transaction rolls back. The transaction approach is the correct production fix.
+
+**For the graph:** After exception, the run can be retried by calling `graph.ainvoke` again with the same `run_id`. LangGraph loads the pre-memory-agent checkpoint and re-runs memory_agent from scratch. With the transactional fix, the re-run succeeds cleanly."
+
+**What it reveals:** Understanding of error handling, partial failure states, and idempotency.
+
+---
+
+### Challenge 8: "How would you implement embedding caching to avoid re-computing?"
+
+**The problem / challenge:** The same text might be captured multiple times (e.g., a user captures the same meeting notes twice). Re-computing the embedding is wasteful.
+
+**Your answer:** "Two levels of caching.
+
+**Level 1 — In-memory hash cache (process lifetime):**
+```python
+import hashlib, functools
+_embed_cache: dict[str, list[float]] = {}
+
+def embed_cached(text: str) -> list[float]:
+    key = hashlib.sha256(text.encode()).hexdigest()
+    if key not in _embed_cache:
+        _embed_cache[key] = _embedder.encode(text).tolist()
+    return _embed_cache[key]
+```
+Fast, zero infrastructure. Cleared on restart. Good for duplicate captures within the same server session.
+
+**Level 2 — DB-backed cache (persistent):**
+```sql
+CREATE TABLE embedding_cache (
+    content_hash TEXT PRIMARY KEY,
+    embedding vector(384),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+```python
+async def embed_with_db_cache(text: str, conn) -> list[float]:
+    key = hashlib.sha256(text.encode()).hexdigest()
+    row = await conn.fetchrow("SELECT embedding FROM embedding_cache WHERE content_hash = $1", key)
+    if row:
+        return row["embedding"]
+    vec = _embedder.encode(text).tolist()
+    await conn.execute("INSERT INTO embedding_cache (content_hash, embedding) VALUES ($1, $2) ON CONFLICT DO NOTHING", key, vec)
+    return vec
+```
+`ON CONFLICT DO NOTHING` handles the race condition where two concurrent requests try to cache the same hash simultaneously.
+
+**Cache invalidation:** Embeddings are deterministic for a given model version. No TTL needed — the cache is valid as long as the model version is unchanged. If the model is upgraded, truncate `embedding_cache`.
+
+**When it matters:** For a personal chief-of-staff processing daily captures, cache hit rate may be low (most captures are unique). But for bulk imports (e.g., importing 500 past email threads), caching becomes significant."
+
+**What it reveals:** Practical performance optimization thinking, understanding of deterministic computation, and cache invalidation strategy.
+
+---
+
+## QUICK-REFERENCE CHEAT SHEET
+
+### Key Numbers
+| Fact | Value |
+|------|-------|
+| Embedding dimensions | 384 |
+| Embedding model | all-MiniLM-L6-v2 |
+| DB tables | 5 (captures, extracted_items, actions, decisions, runs) |
+| Pool min/max connections | 2 / 10 |
+| Similarity threshold | > 0.3 |
+| Index type | HNSW with vector_cosine_ops |
+| State fields | 17 |
+| Viva questions in this doc | 120 |
+
+### Key Design Patterns
+| Pattern | Description |
+|---------|-------------|
+| H2 | Assert item_ids count == extracted_items count |
+| H3 | pending_action_ids + decided_action_ids for multi-resume |
+| H5 | Split audit fields: decisions table separate from actions |
+| H7 | Soft deletes + ON DELETE SET NULL |
+| M4 | Lightweight trace (summaries, not full state dumps) |
+| M5 | HNSW indexes (no training phase) |
+
+### Key Files
+| File | Responsibility |
+|------|---------------|
+| `models.py` | AgentState TypedDict |
+| `agents/memory.py` | Memory agent: embed + persist |
+| `memory/db.py` | asyncpg pool + all CRUD |
+| `memory/retrieval.py` | Two-level semantic search |
+| Schema migrations | 5-table PostgreSQL schema + HNSW indexes |
+
+### State Write Map
+| Agent | Fields Written |
+|-------|---------------|
+| understanding | capture, extracted_entities |
+| intent | extracted_items, clarification_needed, clarification_reason |
+| **memory** | **capture_id, extracted_item_ids** (+ trace entry) |
+| planning | actions, pending_action_ids |
+| tool_router | validated actions, pending_action_ids |
+| approval | trace entry only |
+| execution | execution_results |
+
+### The One-Liner Defenses
+- **Why local embeddings?** Free, no rate limits, no network dependency, sufficient quality.
+- **Why pgvector?** No extra infra, SQL joins, transactional consistency.
+- **Why HNSW?** No training phase, works at any table size.
+- **Why TypedDict?** Plain dict, LangGraph-native, zero runtime overhead.
+- **Why asyncpg?** Fastest Python Postgres client, native async, no ORM overhead.
+- **Why soft deletes?** Preserve audit trail; decisions outlive captures.
+- **Why separate decisions table?** Normalize audit from operations; ON DELETE SET NULL semantics.
+- **Why partial unique index?** Uniqueness for non-null action_ids; allow multiple NULL orphans.
+- **Why MemorySaver?** Demo scale, fast, zero infra; PostgreSQL/Redis checkpointer for production.
+
+---
+
+*End of Utkarsh's Viva Preparation Guide*
+*Orbit AI — Multi-Agent Personal Chief-of-Staff*
+*State & Memory Systems Module*
