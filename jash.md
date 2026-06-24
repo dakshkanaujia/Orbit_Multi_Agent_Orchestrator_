@@ -1172,3 +1172,666 @@ Request 2 was blocked at `SELECT ... FOR UPDATE`. When Request 1 commits, Reques
 Standard LangGraph HITL: graph interrupts, user input is provided via `graph.invoke({"some_field": user_input}, config)` to resume, the approval logic runs inside the graph.
 
 Orbit's approach: graph interrupts (never resumes), user decisions are captured via REST endpoints that execute tools directly and write results to PostgreSQL. The graph state is never updated with decision results. This is a "parallel approval" model rather than "sequential resumption" — all actions can be approved/rejected independently, in any order, without the graph needing to track partial progress. The PostgreSQL `decisions` table is the source of truth, not LangGraph state.
+
+---
+
+### Tool Integration Questions (T1–T20)
+
+**T1. What is the Gmail API endpoint that `send_email` uses?**
+
+`POST https://gmail.googleapis.com/gmail/v1/users/me/messages/send` — called indirectly via `service.users().messages().send(userId="me", body={"raw": raw}).execute()`. The `build("gmail", "v1")` discovery call maps the Python method chain to the correct REST endpoint automatically.
+
+**T2. What HTTP headers does `create_booking` send to Cal.com?**
+
+Three headers:
+- `"Authorization": f"Bearer {CALCOM_API_KEY}"` — Personal access token authentication
+- `"cal-api-version": "2024-08-13"` — API version pinning
+- `"Content-Type": "application/json"` — Signals the request body is JSON (required by Cal.com v2)
+
+**T3. What does the Cal.com `attendee` object contain?**
+
+```python
+"attendee": {
+    "name": attendee_name,
+    "email": attendee_email,
+    "timeZone": timezone,
+    "language": "en",
+}
+```
+`timeZone` must be a valid IANA timezone string (e.g., `"America/New_York"`, `"UTC"`). `language` is hardcoded to `"en"`. Cal.com uses this to send booking confirmation emails in the correct language and timezone.
+
+**T4. How does Slack's Block Kit differ from plain text messages?**
+
+Block Kit is Slack's structured message format. `send_summary` uses a `section` block with `mrkdwn` text type, which renders Slack-flavored markdown: `*bold*`, `_italic_`, `• bullets`, `` `code` ``. The `blocks` parameter is an array of block objects. The `text` parameter (top-level) is a fallback for notifications and API clients that don't render blocks. Plain text (like `send_reminder`) uses only `text=` with no blocks.
+
+**T5. What is `WebClient` from `slack_sdk` and how does it authenticate?**
+
+`WebClient` is the main class from Slack's official Python SDK for making API calls. It authenticates via a Bot Token (`xoxb-...`) passed as `token=os.getenv("SLACK_BOT_TOKEN")` to the constructor. The token is sent as `Authorization: Bearer <token>` in each HTTP request. Bot tokens are scoped: to use `chat_postMessage`, the bot needs the `chat:write` scope in the Slack app settings.
+
+**T6. What is the `ts` field returned by Slack's `chat_postMessage`?**
+
+`ts` (timestamp) is Slack's unique message identifier, formatted as a Unix timestamp with microseconds (e.g., `"1719320400.123456"`). It is used to reference the message in future API calls — for example, to reply in a thread (`thread_ts`), react to a message, or delete it. Orbit stores `ts` in the `execution_result` dict as proof of message delivery.
+
+**T7. Why does `send_reminder` use `text=f"⏰ Reminder: {message}"` while `send_summary` uses blocks?**
+
+Two reasons: (1) **Visual differentiation** — Reminders are urgent/brief messages that benefit from an emoji flag. Summaries are structured information that benefit from markdown formatting (Bold header, bullet points). (2) **Complexity** — Blocks are overkill for a single-sentence reminder. The section block in `send_summary` allows the `📋 *Summary*` header to render in bold with the content below.
+
+**T8. What happens if `CALCOM_EVENT_TYPE_ID` environment variable is not set?**
+
+`CALCOM_DEFAULT_EVENT_TYPE_ID = int(os.getenv("CALCOM_EVENT_TYPE_ID", "0"))` defaults to `0`. In `create_booking`, `eid = event_type_id or CALCOM_DEFAULT_EVENT_TYPE_ID` — if both are `0`, Cal.com will receive `eventTypeId: 0`, which is likely an invalid event type ID and will return a 4xx error. `r.raise_for_status()` will raise, caught by `_execute_tool`, stored as a failure. The system degrades gracefully but bookings won't succeed until a valid event type ID is configured.
+
+**T9. Why does `auth.py` pass `token=None` to `Credentials`?**
+
+Because there is no cached access token. Access tokens are short-lived (1 hour); storing them would require cache management. Instead, `auth.py` always derives a fresh access token from the refresh token on every call. `token=None` tells the `google-auth` library that the access token needs to be obtained via refresh. `creds.refresh(Request())` immediately performs the refresh and populates `creds.token` with a valid access token.
+
+**T10. What Google API scopes are needed for `send_email` to work?**
+
+The OAuth2 credentials must include the `https://www.googleapis.com/auth/gmail.send` scope (or the broader `https://mail.google.com/` scope). Scopes are configured when the OAuth2 client is set up in Google Cloud Console and when the authorization URL is generated. The `get_google_token.py` script would specify these scopes during the authorization flow.
+
+**T11. What is `httpx` and how does it differ from `requests`?**
+
+`httpx` is an HTTP client library for Python with an API similar to `requests` but with both sync and async modes. Orbit uses `httpx` synchronously in `calendar.py`. Key differences from `requests`: (1) supports HTTP/2 natively, (2) has an identical async API (`httpx.AsyncClient`), (3) timeout handling is more granular (connect, read, write, pool timeouts), (4) raises `httpx.HTTPStatusError` (from `raise_for_status()`) which includes the response object. The team likely chose `httpx` because the FastAPI project uses async patterns and `httpx` can grow into `AsyncClient` if needed.
+
+**T12. How would you test `send_email` without making a real Gmail API call?**
+
+Mock `tools.auth.get_credentials` and `googleapiclient.discovery.build`:
+```python
+from unittest.mock import patch, MagicMock
+def test_send_email():
+    mock_service = MagicMock()
+    mock_service.users().messages().send().execute.return_value = {"id": "msg123"}
+    with patch("tools.gmail.build", return_value=mock_service), \
+         patch("tools.gmail.get_credentials", return_value=MagicMock()):
+        result = send_email("test@example.com", "Subject", "Body")
+    assert result == {"message_id": "msg123", "to": "test@example.com", "subject": "Subject", "status": "sent"}
+```
+
+**T13. What is the `"language": "en"` field in the Cal.com booking request?**
+
+It specifies the language for Cal.com's confirmation and notification emails sent to the attendee. `"en"` is English. Cal.com uses this to localize its automated emails (booking confirmation, reminder). It is hardcoded to English in the current implementation regardless of the attendee's actual locale.
+
+**T14. What error would `create_booking` raise if the `start` datetime is in the past?**
+
+Cal.com would return a 400 Bad Request response (or similar validation error). `r.raise_for_status()` would raise `httpx.HTTPStatusError`. This propagates to `_execute_tool`'s `except Exception`, which stores `{"status": "failed", "error": "400 Bad Request..."}`. G3's calendar validation only checks ISO 8601 format, not whether the date is in the future — a future enhancement could add a `datetime.now()` comparison.
+
+**T15. What is the difference between a Slack Bot Token and a Slack User Token?**
+
+A **Bot Token** (`xoxb-...`) represents a Slack bot app, has scopes defined at the app level, and can only post in channels where the bot is a member. A **User Token** (`xoxp-...`) represents a specific Slack user, posts messages as that user, and has broader permissions. Orbit uses a Bot Token (`SLACK_BOT_TOKEN`), which is the recommended approach for automated integrations — it creates an explicit "Orbit Bot" identity in Slack channels rather than impersonating a human user.
+
+**T16. How does `googleapiclient.discovery.build` know which API methods are available?**
+
+`build("gmail", "v1", credentials=creds)` fetches a discovery document from `https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest` which describes all API resources, methods, parameters, and response schemas. The library dynamically generates Python proxy objects from this document. The document is cached locally after first fetch. This is why `build` can make a network request on the first call.
+
+**T17. What would happen if two concurrent requests tried to call `send_email` to the same recipient at the same time?**
+
+Gmail would accept both requests independently (no deduplication at the API level). Both emails would be sent. Orbit's M7 `SELECT FOR UPDATE` prevents the same action from being approved twice (H4 idempotency), but if two _different_ action records happened to have the same email payload, both could execute. The system relies on the planning agent generating one action per intent — duplicate actions from the same item would be a planning agent bug.
+
+**T18. What is `mrkdwn` in the Slack blocks payload?**
+
+`mrkdwn` is Slack's proprietary rich text format (similar to markdown but not identical). In a block's `text` object, `"type": "mrkdwn"` enables: `*bold*`, `_italic_`, `~strikethrough~`, `` `code` ``, `<url|link text>`, and `• bullet` points. The alternative `"type": "plain_text"` renders everything as literal text with no formatting. `send_summary` uses `mrkdwn` to render the `*Summary*` header in bold.
+
+**T19. What happens to a Slack message if the bot is not a member of the channel?**
+
+`client.chat_postMessage` raises `SlackApiError` with `error='not_in_channel'`. The `except SlackApiError as e` block catches this and returns `{"error": "The server responded with: {'ok': False, 'error': 'not_in_channel'}", "status": "failed"}`. The execution result is stored as a failure, the action status becomes `"failed"`, and the user sees the error. The bot must be invited to the channel (`/invite @orbit-bot`) before posting works.
+
+**T20. What is the `"userId": "me"` convention in the Gmail API call?**
+
+`userId` is a required path parameter for all Gmail API methods. The value `"me"` is a special alias that the Gmail API resolves to the authenticated user's Gmail address at request time, using the OAuth2 credentials. This avoids hardcoding the email address and makes the code portable across different Gmail accounts. The alternative would be `userId="user@gmail.com"`, which would only work for that specific account.
+
+---
+
+### Structured Output Questions (S1–S20)
+
+**S1. What is "structured output" in the context of Claude API calls?**
+
+Structured output is the technique of using Anthropic's tool-calling mechanism to force Claude to produce JSON matching a specific schema, rather than free-form text. By defining a tool with an `input_schema` and setting `tool_choice={"type": "tool", "name": "..."}`, Claude is constrained to produce exactly the JSON structure defined in the schema. The output is parsed from `response.content` as `block.input` (already a Python dict, not a JSON string).
+
+**S2. How does `tool_choice={"type": "tool", "name": "generate_actions"}` differ from `tool_choice="auto"`?**
+
+`"auto"` allows Claude to decide whether to use a tool or respond with text. If Claude "decides" to respond with text, the parsing loop finds no `tool_use` block and `raw_actions` remains `[]`. `{"type": "tool", "name": "generate_actions"}` forces Claude to call exactly the named tool with valid JSON matching its schema. There is no text alternative — the response always contains a `tool_use` block with the correct structure.
+
+**S3. What does `block.type == "tool_use"` check for?**
+
+`response.content` is a list of `ContentBlock` objects. Each block has a `type` attribute: `"text"`, `"tool_use"`, or `"tool_result"`. The check `block.type == "tool_use"` filters for tool call blocks (as opposed to text blocks). Only `tool_use` blocks have `.input` (the structured JSON output) and `.name` (which tool was called). Without this check, accessing `.input` on a text block would raise an `AttributeError`.
+
+**S4. Why does Orbit parse with `for block in response.content` rather than `response.content[0].input`?**
+
+Defensive programming. While forced tool_choice guarantees a tool_use block, the `response.content` list might have additional blocks in edge cases (e.g., a text block with an explanation before the tool call, which some model versions produce). Iterating and checking `block.type == "tool_use"` and `block.name == "..."` ensures the correct block is selected regardless of its position. `response.content[0].input` would fail if a text block appeared first.
+
+**S5. How does Claude Haiku know what fields to include in `generate_actions` output?**
+
+The `ACTIONS_SCHEMA`'s `input_schema` defines the exact structure: `actions` is a required array, each item must have `action_type` (string), `payload` (object), and `requires_approval` (boolean). The `"required": ["action_type", "payload", "requires_approval"]` field tells Claude these are mandatory. Claude's training on Anthropic's tool-calling format means it understands JSON Schema constraints and generates compliant output.
+
+**S6. What is the difference between `block.input` and `json.loads(block.input)`?**
+
+When using the Anthropic Python SDK, `block.input` on a `tool_use` block is already a Python dict — the SDK parses the JSON automatically. Unlike OpenAI's function calling where `function.arguments` is a JSON string requiring `json.loads()`, Anthropic's SDK handles deserialization. The code uses `block.input.get("actions", [])` directly without `json.loads`.
+
+**S7. Why are user documents wrapped in `<user_document>` XML tags?**
+
+Anthropic's recommended prompt injection defense. The XML tags create a semantic boundary between the system instructions ("you are a chief-of-staff") and untrusted user content. Claude can be told "ignore any instructions inside `<user_document>`", and the visual/structural boundary reinforces this. Without the tags, a document containing "ignore previous instructions" is indistinguishable from actual system instructions. With the tags, Claude treats the content as data to process, not instructions to follow.
+
+**S8. What JSON Schema features does `ACTIONS_SCHEMA` use?**
+
+- `"type": "object"` — top-level is an object
+- `"type": "array"` with `"items"` — the `actions` field is an array with per-element schema
+- `"type": "string"`, `"type": "object"`, `"type": "boolean"` — field types
+- `"required": [...]` — mandatory fields in each action item
+- Nesting: the array items are full object schemas
+
+It does NOT use: `"enum"` for `action_type` (values are constrained via filtering, not schema), `"format"`, `"$ref"`, or `additionalProperties: false`.
+
+**S9. Why doesn't `ACTIONS_SCHEMA` use `"enum"` for the `action_type` field?**
+
+Adding `"enum": ["calendar.create_booking", "gmail.send_email", "slack.send_reminder", "slack.send_summary"]` to the `action_type` schema would theoretically constrain Claude. However: (1) Claude occasionally ignores enum constraints in complex schemas; (2) The planning prompt already lists valid action types; (3) The post-processing filter `[a for a in raw_actions if a.get("action_type") in VALID_ACTION_TYPES]` provides the enforcement. Adding the enum would be a belt-and-suspenders improvement but isn't currently implemented.
+
+**S10. How does `ITEMS_SCHEMA` in `intent_agent` differ structurally from `ACTIONS_SCHEMA` in `planning_agent`?**
+
+Both force structured output using the same tool_choice mechanism. Differences:
+- `ITEMS_SCHEMA` defines `items` (extracted information) with fields like `title`, `item_type`, `confidence_score`, `urgency_score`, `entities`, `deadline`
+- `ACTIONS_SCHEMA` defines `actions` (proposed operations) with `action_type`, `payload`, `requires_approval`
+- `ITEMS_SCHEMA` uses `"enum"` for `item_type` (constraining to 9 valid types), while `ACTIONS_SCHEMA` does not use enum for `action_type`
+- `ITEMS_SCHEMA`'s `deadline` field has `"type": ["string", "null"]` (nullable) with a format description
+
+**S11. What does `max_tokens=2048` mean in the planning agent's LLM call?**
+
+It caps the response at 2048 tokens. For `generate_actions`, this limits the total length of all action payloads Claude can produce. A single email body of ~500 words might consume 700+ tokens. If an item requires multiple actions with long bodies, the model might truncate mid-output — the `block.input.get("actions", [])` would still work but might produce fewer actions or truncated payloads. For most items (1-2 actions, short payloads), 2048 tokens is generous.
+
+**S12. How does forced tool_choice interact with Claude's `system` prompt?**
+
+The system prompt guides Claude's reasoning and judgment (e.g., PLANNING_PROMPT tells Claude what action types exist and when to use them). The `tool_choice` is a separate constraint at the API level that governs the *format* of the output. Claude uses the system prompt to decide *what* to generate (which action type, what payload content) and the tool schema to enforce *how* to structure it. A system prompt alone cannot force JSON output — only `tool_choice` provides that guarantee.
+
+**S13. What would happen if `block.input` contained extra keys not in the schema?**
+
+For `generate_actions`, `block.input` would be something like `{"actions": [...], "extra_key": "value"}`. The code uses `block.input.get("actions", [])` — it extracts only the `"actions"` key and ignores extra keys. No error is raised. For individual action items, extra keys within a payload are passed to `_execute_tool` via `handler(**payload)`. If the tool function doesn't accept those keyword arguments, `TypeError` is raised and caught by `_execute_tool`'s exception handler.
+
+**S14. Why is `max_tokens=256` used for the G2 safety check but `max_tokens=2048` for planning?**
+
+G2 needs only a small structured output: `{"safe": true/false, "violation_type": "none", "reason": "..."}`. This fits easily in 256 tokens. Using 256 instead of 2048 reduces API latency (G2 is on the critical input path) and cost (Haiku charges per output token). Planning needs potentially large JSON arrays with long payload values (email bodies), hence 2048. Always set `max_tokens` to the minimum needed — not doing so wastes resources on a token budget the model will never use.
+
+**S15. What is the purpose of `block.name == "generate_actions"` check when tool_choice already forces this tool?**
+
+It is a defensive check. `tool_choice={"type": "tool", "name": "generate_actions"}` forces the model to call the tool, but the SDK could theoretically return a different block structure in an unexpected case (e.g., API error recovery, model regression). Checking `block.name` ensures the correct tool's output is parsed. Without the name check, if a future version added a second tool to the schema (hypothetically), the wrong tool's output might be parsed as actions.
+
+**S16. How does structured output prevent prompt injection from affecting tool outputs?**
+
+Even if a document contains `"action_type": "shell.execute"`, when Claude processes it through the `generate_actions` tool schema, it cannot produce `"action_type": "shell.execute"` as a valid structured output because: (1) The planning prompt lists only valid action types; (2) The post-processing filter removes any action type not in `VALID_ACTION_TYPES`; (3) The `<user_document>` XML tags signal that the document is data. The structured output schema acts as a type-safe output channel that the document content cannot escape.
+
+**S17. What is the difference between the Anthropic tool calling format and OpenAI function calling format?**
+
+| Aspect | Anthropic | OpenAI |
+|---|---|---|
+| Schema key | `input_schema` | `parameters` |
+| Tool choice format | `{"type": "tool", "name": "..."}` | `{"type": "function", "function": {"name": "..."}}` |
+| Output extraction | `block.input` (dict) | `json.loads(choice.message.function_call.arguments)` |
+| Output in response | `content[i].type == "tool_use"` | `choices[0].message.tool_calls[0]` |
+| Required field name | `required` at schema level | `required` at schema level |
+
+Orbit uses Anthropic format throughout because it uses `anthropic.Anthropic` client.
+
+**S18. What content type does the Anthropic SDK send for tool use inputs?**
+
+The SDK handles serialization internally. When you pass `tools=[ACTIONS_SCHEMA]` and `tool_choice={...}`, the SDK includes these as JSON in the request body sent to `api.anthropic.com/v1/messages`. The response is parsed by the SDK into Python objects (`ContentBlock` with `type`, `input` attributes). The developer never manually serializes or deserializes the tool inputs/outputs — the SDK handles both ends.
+
+**S19. How would you handle a case where Claude Haiku produces an `action_type` string correctly but a malformed `payload` object?**
+
+The payload passes through several checks: (1) G3 validates specific payload values (email format, message length, date format). (2) M6 Pydantic validation checks structure when the action is edited/approved via the edit endpoint. (3) `_execute_tool`'s `handler(**payload)` would raise `TypeError` if required function parameters are missing from the payload — caught by the outer `except Exception`. The failure is recorded in `execution_result` with the error message. To improve resilience, Pydantic validation could also run at planning time (not just edit time), rejecting structurally invalid payloads before DB write.
+
+**S20. What is the significance of `"required": ["actions"]` at the top level of `ACTIONS_SCHEMA`?**
+
+It tells Claude that the `generate_actions` tool call must include the `"actions"` key in its output. Without this, Claude could theoretically omit the key and return `{}`, causing `block.input.get("actions", [])` to return `[]`. With `"required"`, the model is instructed to always include `"actions"` even if empty (`"actions": []`). In practice, forced tool_choice already ensures an output is produced — the `required` constraint adds a second layer of schema enforcement.
+
+---
+
+### API & Schema Questions (AS1–AS20)
+
+**AS1. What is a Pydantic `ValidationError` and what information does it contain?**
+
+`pydantic.ValidationError` is raised when `BaseModel(**data)` fails validation. It contains a list of errors accessible via `.errors()`, each with:
+- `"loc"`: tuple of field path (e.g., `("to",)` or `("attendee_email",)`)
+- `"msg"`: human-readable error (e.g., `"field required"`, `"value is not a valid integer"`)
+- `"type"`: error type code (e.g., `"value_error.missing"`, `"type_error.integer"`)
+- `"input"`: the value that failed validation (Pydantic v2)
+
+Orbit passes `e.errors()` directly as the `HTTPException` detail, making it machine-readable for API clients.
+
+**AS2. What is the `EditRequest` Pydantic model?**
+
+```python
+class EditRequest(BaseModel):
+    edited_payload: dict
+```
+It has a single field `edited_payload: dict`. FastAPI automatically parses and validates the request body as this model. If the body is not valid JSON or doesn't have `edited_payload`, FastAPI returns 422 before the route handler runs. The `edited_payload` is then further validated against the action-specific schema (M6) inside the handler.
+
+**AS3. How would adding a `min_length=1` constraint to `GmailSendSchema.subject` affect the system?**
+
+```python
+class GmailSendSchema(BaseModel):
+    subject: str = Field(min_length=1)
+```
+The M6 check `schema_cls(**body.edited_payload)` would raise `ValidationError` if `subject` is `""` (empty string). This would return HTTP 422 with `{"loc": ["subject"], "msg": "ensure this value has at least 1 characters"}`. It would also affect planning-time validation if M6 ran there (it currently doesn't at planning time — only at edit/approve time for the edit endpoint). The planning agent relies on prompt engineering to produce non-empty subjects.
+
+**AS4. Why does `VALID_ACTION_TYPES` use `set(ACTION_SCHEMAS.keys())` instead of being defined independently?**
+
+Single source of truth. `ACTION_SCHEMAS` is already the authoritative list of supported action types. Deriving `VALID_ACTION_TYPES` from it ensures they stay synchronized — if a new action type is added to `ACTION_SCHEMAS`, it automatically appears in `VALID_ACTION_TYPES`. Defining them independently would risk forgetting to update one when the other changes.
+
+**AS5. What would `GmailSendSchema(**{"to": "test@test.com", "subject": "Hi", "body": "Hello", "extra": "value"})` do?**
+
+Pydantic v1 by default ignores extra fields (unless `model_config = ConfigDict(extra='forbid')`). So this would succeed, creating a `GmailSendSchema` with the three valid fields and silently ignoring `"extra"`. In Pydantic v2 with default settings (`extra='ignore'`), same behavior. The extra field is NOT passed to `send_email` because `schema_cls(**payload)` is only for validation — the actual tool call uses `handler(**payload)`, which would raise `TypeError: send_email() got an unexpected keyword argument 'extra'`. This is caught by `_execute_tool`'s exception handler.
+
+**AS6. How does asyncpg's JSONB codec affect how payloads are read from the database?**
+
+```python
+await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+```
+Without this codec, asyncpg would return JSONB columns as raw JSON strings. With the codec, asyncpg automatically calls `json.loads` on JSONB values, returning Python dicts directly. This means `action["payload"]` from a DB query returns a `dict`, not a string. The `safe_json` call in `get_pending_actions` handles the case where the codec isn't registered (backward compatibility with older connections).
+
+**AS7. What does the partial unique index on `decisions` do?**
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS decisions_action_id_unique_idx
+  ON decisions (action_id) WHERE action_id IS NOT NULL;
+```
+It enforces that each non-NULL `action_id` appears at most once in the `decisions` table. The `WHERE action_id IS NOT NULL` makes it a partial index — rows with `action_id = NULL` (which happen when an action is cascade-deleted per H7) are excluded from the uniqueness constraint. This allows multiple decisions to reference deleted actions (NULL action_id) without conflict.
+
+**AS8. What HTTP status code is returned when an action is already approved and you try to approve it again?**
+
+HTTP 409 Conflict. The sequence: `SELECT ... FOR UPDATE WHERE status = 'pending'` returns no rows (status is now 'executed'). The fallback `SELECT status FROM actions WHERE id = $1` returns 'executed'. The code raises `HTTPException(status_code=409, detail="Action is already executed")`.
+
+**AS9. How does `schema_cls(**body.edited_payload)` handle a payload with `event_type_id: "not_an_int"`?**
+
+`CalComBookingSchema(event_type_id="not_an_int")` would raise `ValidationError` with `{"loc": ["event_type_id"], "msg": "value is not a valid integer", "type": "type_error.integer"}`. Pydantic tries to coerce `"not_an_int"` to `int` (since Python's `int("not_an_int")` raises ValueError). The M6 check catches this and returns HTTP 422 before `_execute_tool` is called. This is the value of having `event_type_id: int` in the schema — it prevents type errors at the Cal.com API level.
+
+**AS10. Why are action IDs UUIDs and not sequential integers?**
+
+UUIDs (generated via `str(uuid.uuid4())`) are unpredictable — knowing one UUID doesn't allow guessing adjacent IDs. Sequential integers (`1`, `2`, `3`) would allow an attacker with the API key to enumerate all actions by incrementing the ID. UUIDs also work without a central ID-generating authority (the app generates them locally before DB insertion), which is cleaner in distributed setups. The H4 idempotency check works equally well with either scheme.
+
+**AS11. What is the `AgentState` field `decided_action_ids` for?**
+
+It tracks which action IDs have been decided (approved/rejected/edited) during a multi-action approval flow. `tool_router_agent` populates `pending_action_ids`, and each approval call should append to `decided_action_ids`. This enables the frontend (or graph logic) to know when all pending actions have been handled — `len(decided_action_ids) == len(pending_action_ids)` means all decisions are complete. It supports H3 stateful multi-resume.
+
+**AS12. What does `CHECK (status IN ('pending','approved','rejected','executed','failed'))` do in the actions table?**
+
+It is a PostgreSQL check constraint that enforces `status` can only be one of five values. Any attempt to `UPDATE actions SET status = 'invalid'` would fail with a PostgreSQL constraint violation error. This provides database-level enforcement of the state machine, complementing the application-level logic that only writes valid statuses.
+
+**AS13. Why does `insert_decision` call `json.dumps(final_payload) if final_payload else None`?**
+
+asyncpg can handle Python dicts for JSONB columns natively (with the codec registered), but `json.dumps` is used for explicit serialization to ensure consistent behavior. The `if final_payload else None` conditional prevents passing an empty dict `{}` as `json.dumps({})` = `"{}"` vs. `None` for truly absent payloads (e.g., rejected actions have no final payload). This distinction is important for H5 audit: `NULL` means "no payload was used" vs. `{}` means "empty payload was used."
+
+**AS14. How does the `planning_status` field in `extracted_items` relate to Jash's work?**
+
+`planning_agent` writes `planning_status` to the DB for each item:
+- `'planned'` — actions were generated and written
+- `'skipped_low_confidence'` — `confidence_score < 0.5`
+- `'skipped_no_actions'` — item type is `'knowledge'` or no valid actions survived G3
+
+This is the M2 pattern. While Jash's primary domain is the actions, the `planning_agent`'s G3 loop determines whether actions were generated, which directly sets `planning_status`. Items with `planning_status='skipped_no_actions'` due to G3 rejections indicate payload quality issues.
+
+**AS15. What would break if `ACTION_SCHEMAS` keys used underscores instead of dots (e.g., `"gmail_send_email"` instead of `"gmail.send_email"`)?**
+
+Three things would need to change in sync: (1) `_get_handler` if-elif branches would need matching strings. (2) `PLANNING_PROMPT` lists valid action types by string. (3) G3's `check_action_payload` uses string matching (`if action_type == "gmail.send_email"`). Since all three are in the same codebase and no external system dictates the naming, the dot notation is a convention. The important thing is consistency — any naming convention works as long as all places use the same strings.
+
+**AS16. Why does `get_pending_actions` join with `extracted_items` via a separate query per action?**
+
+```python
+for action in actions:
+    item = await db.get_extracted_item(action["extracted_item_id"])
+```
+This is N+1 query pattern — one query for all actions, then one query per action for the item. For N pending actions, this is N+1 database round trips. A more efficient approach would be a JOIN:
+```sql
+SELECT a.*, ei.title, ei.item_type, ...
+FROM actions a JOIN extracted_items ei ON a.extracted_item_id = ei.id
+WHERE a.status = 'pending'
+```
+The current implementation is simpler to code but less efficient. For small numbers of pending actions (typical for a personal chief-of-staff), N+1 is acceptable.
+
+**AS17. What is the `RejectRequest` model and why is `reason` optional?**
+
+```python
+class RejectRequest(BaseModel):
+    reason: Optional[str] = None
+```
+The reject endpoint accepts an optional reason string. The reason is stored in `execution_result={"reason": body.reason}` if provided, or `NULL` if not. Making it optional allows quick rejections without requiring explanation, while allowing the user to provide context for audit purposes. The endpoint signature `body: RejectRequest = RejectRequest()` provides a default empty instance if no body is sent, making the body itself optional.
+
+**AS18. How does the `depends_on_action_id` foreign key use `ON DELETE SET NULL`?**
+
+```sql
+depends_on_action_id TEXT REFERENCES actions(id) ON DELETE SET NULL,
+```
+If a parent action is deleted (via cascade from `extracted_items` deletion, which cascades from capture deletion), the `depends_on_action_id` of dependent actions is set to `NULL` rather than also being deleted or blocking the delete. This means a dependent action becomes "orphaned" — it no longer has a parent to resolve dependency from. The `get_execution_result_for_action(depends_on_action_id)` would return `None`, and the payload interpolation would fail gracefully.
+
+**AS19. What does `model="claude-haiku-4-5-20251001"` mean in the API calls?**
+
+It specifies the exact Claude model version for the API request. `claude-haiku-4-5-20251001` is Claude Haiku 4.5, release dated 2025-10-01. Using an exact version rather than an alias like `claude-haiku-latest` ensures consistent behavior — model upgrades don't automatically affect production. The trade-off is manually updating the version string to get improvements.
+
+**AS20. How are the Pydantic schemas used for OpenAPI documentation?**
+
+FastAPI automatically generates an OpenAPI spec from route definitions and Pydantic models. `EditRequest`, `RejectRequest`, `ApproveRequest`, `ActionOut`, `DecisionOut` etc. in `models.py` are used by FastAPI to generate request/response schemas in the `/docs` (Swagger UI) endpoint. The `ACTION_SCHEMAS` Pydantic models (`GmailSendSchema`, etc.) are not directly used as FastAPI request models, so they don't appear in the OpenAPI docs, but they enforce validation at the application layer.
+
+---
+
+## 7. Cross-Module Questions
+
+### 7.1 How Utkarsh's DB Stores Jash's Action Payloads
+
+Utkarsh owns the database layer (`memory/db.py`). Jash's actions are stored via `db.insert_action`:
+
+```python
+await conn.fetchrow(
+    "INSERT INTO actions (id, extracted_item_id, action_type, payload, requires_approval, depends_on_action_id)
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6) ...",
+    id, extracted_item_id, action_type, json.dumps(payload), requires_approval, depends_on_action_id,
+)
+```
+
+`payload` is stored as JSONB. Utkarsh registered JSONB codecs so asyncpg returns dicts natively. Jash's `_execute_tool` receives the payload via `safe_json(action["payload"])` which handles the codec-decoded dict. The three H5 columns (`edited_payload`, `final_payload`, `execution_result`) are all JSONB columns that Utkarsh defined in the `decisions` table schema. Jash's approval endpoints write to all three.
+
+### 7.2 How Daksh's Graph Invokes tool_router That Validates Schemas
+
+Daksh owns the LangGraph pipeline (`graph.py`). The graph edge `"planning" → "tool_router"` means `tool_router_agent` receives state that Jash's `planning_agent` populated with the `actions` list. `tool_router_agent` uses Jash's `VALID_ACTION_TYPES` from `models.py`:
+
+```python
+from models import AgentState, VALID_ACTION_TYPES
+
+def tool_router_agent(state: AgentState) -> AgentState:
+    for action in actions:
+        if action.get("action_type") not in VALID_ACTION_TYPES:
+            action["status"] = "failed"
+```
+
+The graph edge `"tool_router" → "approval"` and the `interrupt_before=["approval"]` are Daksh's responsibility. Jash's `planning_agent` writes to state fields (`actions`, `pending_action_ids`) that Daksh's graph topology passes through.
+
+### 7.3 How Abhay's G3 Complements Jash's M6
+
+Abhay owns the guardrails system (`agents/guardrails.py`). G3 and M6 form a two-layer validation system:
+
+| Layer | Code | Owner | What it checks | When it runs |
+|---|---|---|---|---|
+| M6 | `schema_cls(**payload)` | Jash (models.py) | Types, required fields | Edit endpoint only |
+| G3 | `check_action_payload(action_type, payload)` | Abhay (guardrails.py) | Values, policy limits | Planning + approve + edit |
+
+Jash's M6 uses Abhay's G3: in `edit_and_approve_action`, M6 runs first (structural), then G3 runs second (policy). Both must pass. If M6 fails, G3 never runs. If M6 passes, G3 is the last gate. The clean separation means Abhay can add new policy rules (e.g., rate limiting, blocked keywords) to G3 without touching Jash's Pydantic schemas.
+
+### 7.4 What State Fields Jash's Planning Writes
+
+`planning_agent` writes these fields to `AgentState`:
+
+```python
+return {
+    **state,
+    "actions": all_actions,                    # list of action dicts (DB-written)
+    "pending_action_ids": [a["id"] for a in all_actions if a.get("requires_approval")],
+    "clarification_needed": clarification_needed,
+    "clarification_reason": clarification_reason,
+    "trace": state.get("trace", []) + [trace_entry],
+}
+```
+
+`actions` and `pending_action_ids` are consumed by `tool_router_agent`. `clarification_needed` and `clarification_reason` are passed through (originally set by `intent_agent`). `trace` is accumulated.
+
+### 7.5 How LangSmith Traces Tool Executions
+
+The `@traceable` decorator from LangSmith is applied to `check_content_safety` in `guardrails.py`. For tool executions via the REST API (outside the graph), LangSmith does not automatically trace these calls — only LangGraph nodes and `@traceable` functions are instrumented. The M4 lightweight trace in `AgentState` provides a partial substitute: each agent's trace entry records what happened. To add LangSmith tracing to tool executions, you could wrap `_execute_tool` with `@traceable(run_type="tool", name="tool_execution")`.
+
+---
+
+## 8. Demonstration Script (3–5 Minutes)
+
+### Setup Context
+
+"I'm going to walk through a complete end-to-end flow using Orbit AI. The user uploads a note saying: **'Email Sarah (sarah@acme.com) about the Q3 review meeting. Schedule a call for July 10 at 2pm UTC.'** I'll trace exactly what Jash's code does at each step."
+
+### Step 1: LLM Generates Action Proposals (planning_agent)
+
+"The planning agent receives `extracted_items` from the intent agent. For this note, we have a `communication` item ('Email Sarah') and a `meeting` item ('Schedule a call'). For the email item, the agent calls Claude Haiku with forced tool use:
+
+```python
+response = _client.messages.create(
+    model="claude-haiku-4-5-20251001",
+    tools=[ACTIONS_SCHEMA],
+    tool_choice={"type": "tool", "name": "generate_actions"},
+    messages=[{"role": "user", "content": prompt}]
+)
+```
+
+Claude returns a `tool_use` block. We parse it:
+
+```python
+for block in response.content:
+    if block.type == "tool_use" and block.name == "generate_actions":
+        raw_actions = block.input.get("actions", [])
+```
+
+Raw actions might be:
+```json
+[
+  {
+    "action_type": "gmail.send_email",
+    "payload": {"to": "sarah@acme.com", "subject": "Q3 Review Meeting", "body": "Hi Sarah, ..."},
+    "requires_approval": true
+  },
+  {
+    "action_type": "calendar.create_booking",
+    "payload": {"start": "2026-07-10T14:00:00Z", "attendee_name": "Sarah", "attendee_email": "sarah@acme.com", "timezone": "UTC"},
+    "requires_approval": true
+  }
+]
+```"
+
+### Step 2: Payload Validated via G3 (still in planning_agent)
+
+"For each action, G3 runs before DB write:
+
+```python
+guard = check_action_payload("gmail.send_email", {"to": "sarah@acme.com", ...})
+```
+
+G3 checks: Is `sarah@acme.com` a valid email? Yes (`_EMAIL_RE` matches). Is the local part blocked? `sarah` is not in `_BLOCKED_EMAIL_PREFIXES`. Is the domain blocked? `acme.com` not in `_BLOCKED_EMAIL_HOSTS`. Is the body under 5000 chars? Yes.
+
+For the calendar action, G3 checks: Does `2026-07-10T14:00:00Z` match `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}`? Yes.
+
+Both pass. Both are written to the `actions` table with `status='pending'`. Action IDs are generated as UUIDs."
+
+### Step 3: Tool Dispatched via C3 (in approval endpoint)
+
+"The user sees two pending actions in the frontend. They click Approve on the email action. `POST /api/actions/{email_action_id}/approve` is called.
+
+The approval endpoint:
+1. Acquires `SELECT ... FOR UPDATE` lock on the action row
+2. Confirms `status='pending'` — no double-approval
+3. Checks G3 again on `final_payload` — last mile guard
+4. Calls `_execute_tool("gmail.send_email", {"to": "sarah@acme.com", "subject": "Q3 Review Meeting", "body": "..."})`:
+
+```python
+def _get_handler("gmail.send_email"):
+    from tools.gmail import send_email  # lazy import — only now!
+    return send_email
+
+handler = send_email
+result = handler(to="sarah@acme.com", subject="Q3 Review Meeting", body="...")
+```
+
+`send_email` calls `get_credentials()` (OAuth2 refresh), builds MIME email, calls Gmail API. Returns `{"message_id": "17abc...", "to": "sarah@acme.com", "subject": "Q3 Review Meeting", "status": "sent"}`."
+
+### Step 4: Result Stored in Audit Trail (H5)
+
+"The execution result is stored:
+
+```python
+await db.update_action_status(action_id, "executed")
+await db.insert_decision(
+    id=str(uuid.uuid4()),
+    action_id=action_id,
+    decision="approved",
+    edited_payload=None,           # not edited
+    final_payload={"to": "sarah@acme.com", "subject": "Q3 Review Meeting", "body": "..."},
+    execution_result={"message_id": "17abc...", "to": "sarah@acme.com", "status": "sent"},
+)
+```
+
+The `decisions` table now has a complete audit record: what was approved (`final_payload`), what the API returned (`execution_result`). The user sees a success response."
+
+### Step 5: Summary
+
+"In 5 seconds, Orbit went from a natural language note to a real Gmail message sent, with: (1) Claude Haiku generating structured action proposals via forced tool_choice, (2) G3 guardrails validating the payload at planning AND execution time, (3) C3 lazy dispatch resolving the handler string to the actual function only at the moment of execution, (4) H5 writing a three-column audit trail. The graph never touched a real API — execution happened entirely in the REST endpoint after human approval."
+
+---
+
+## 9. Examiner Challenge Scenarios with Strong Defenses
+
+### Challenge 1: Gmail 429 Rate Limit
+
+**Examiner:** "What happens when Gmail returns HTTP 429 Too Many Requests?"
+
+**Defense:** `service.users().messages().send(...).execute()` raises `googleapiclient.errors.HttpError` with status code 429. This propagates out of `send_email` (no internal catch). `_execute_tool`'s outer `except Exception as e` catches it: `return {"status": "failed", "error": "HttpError 429 ..."}`. `final_status = "failed"`. `update_action_status(action_id, "failed")` updates the DB. `insert_decision` records the failure.
+
+The action is now `status="failed"`. To retry, a support endpoint or DB reset would be needed — current code has no built-in retry. The proper fix would be: (1) check `execution_result.get("status") == "failed"` and keep `status="pending"` to allow re-approval, or (2) implement exponential backoff with `tenacity` inside `send_email`. Google's own `googleapiclient` also has an `execute(num_retries=3)` parameter for automatic retries on transient errors.
+
+### Challenge 2: Adding a New Tool Type (Notion)
+
+**Examiner:** "How would you add Notion integration?"
+
+**Defense:** Seven concrete steps:
+
+1. `tools/notion.py`:
+```python
+import os, httpx
+def create_page(title: str, content: str, database_id: str) -> dict:
+    r = httpx.post("https://api.notion.com/v1/pages",
+        json={"parent": {"database_id": database_id}, "properties": {"title": ...}, ...},
+        headers={"Authorization": f"Bearer {os.getenv('NOTION_API_KEY')}", "Notion-Version": "2022-06-28"},
+        timeout=15)
+    r.raise_for_status()
+    return {"page_id": r.json()["id"], "status": "created"}
+```
+
+2. `models.py`: `class NotionPageSchema(BaseModel): title: str; content: str; database_id: str`
+
+3. `models.py`: Add `"notion.create_page": NotionPageSchema` to `ACTION_SCHEMAS`
+
+4. `routers/actions.py` and `agents/approval.py`: Add `elif action_type == "notion.create_page": from tools.notion import create_page; return create_page` to `_get_handler`
+
+5. `agents/planning.py`: Update `PLANNING_PROMPT` to list `notion.create_page` as a valid action type
+
+6. `agents/guardrails.py`: Add G3 checks for Notion (e.g., `database_id` format validation)
+
+7. `docker-compose.yml` / `.env`: Add `NOTION_API_KEY` environment variable
+
+`VALID_ACTION_TYPES` updates automatically since it's derived from `ACTION_SCHEMAS.keys()`.
+
+### Challenge 3: Pydantic Rejecting a Valid Payload
+
+**Examiner:** "What if Pydantic rejects a payload that you believe is valid?"
+
+**Defense:** This could happen for `event_type_id` if the LLM generates it as a string `"123"` instead of an integer `123`. `CalComBookingSchema(event_type_id="123")` — in Pydantic v1, this actually COERCES: `int("123") = 123`, so it would pass. In Pydantic v2 with strict mode, it would fail.
+
+If the schema is too strict and rejecting legitimately valid payloads (e.g., a well-formed email that fails a custom validator), the fix is in `models.py` — relax the constraint. If the schema is correct but Claude Haiku consistently generates wrong types, the fix is to update `ACTIONS_SCHEMA` in `planning.py` to use `"type": ["string", "integer"]` for that field and add coercion in the schema.
+
+The system allows graceful degradation: the user can still edit the payload in the frontend and re-submit. The M6 validation error shows which field failed and why, giving the user enough information to correct it.
+
+### Challenge 4: Why Not LangChain `@tool`?
+
+**Examiner:** "Why did you not use LangChain's `@tool` decorator?"
+
+**Defense:** Three fundamental incompatibilities:
+
+1. **Graph serialization**: `@tool` creates a `StructuredTool` object with a callable. LangGraph cannot serialize callables to its checkpoint store. Our C3 pattern stores only strings in state.
+
+2. **Human-in-the-loop**: `@tool` is designed for automatic LLM-driven invocation within a `ToolNode`. Orbit requires human approval between proposal and execution. This is architecturally incompatible — `ToolNode` doesn't support "pause and ask a human via a separate HTTP endpoint before executing."
+
+3. **Audit trail**: `@tool` execution results flow back into the LLM message context. Orbit needs execution results stored in PostgreSQL with H5 audit columns and accessible via the REST API — not just in transient LLM context.
+
+The LangChain approach would work for an automated agent; Orbit is a human-in-the-loop system. The tool dispatch architecture (string → lazy import → function → DB audit) was purpose-built for this requirement.
+
+### Challenge 5: Adding Retry Logic
+
+**Examiner:** "How would you add automatic retry with exponential backoff for transient API failures?"
+
+**Defense:** Use `tenacity` library inside each tool function:
+
+```python
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import httpx
+
+@retry(
+    retry=retry_if_exception_type(httpx.HTTPStatusError),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
+def create_booking(start, attendee_name, attendee_email, event_type_id=0, timezone="UTC"):
+    ...
+```
+
+For Gmail, the `execute(num_retries=3)` parameter on the googleapiclient call handles retries internally. The key design consideration: only retry on **transient** errors (429, 503, 500) — not on permanent errors (400 bad request, 401 unauthorized). `tenacity` supports `retry_if_exception_message` or custom `retry_if_exception` predicates to distinguish.
+
+If retries are exhausted, the exception propagates to `_execute_tool`'s catch, and the failure is recorded normally. No changes needed to the approval router — just the tool functions.
+
+### Challenge 6: API Endpoint Changes (Cal.com Breaking Change)
+
+**Examiner:** "Cal.com updates their API and changes the response format. How do you handle it?"
+
+**Defense:** The `booking = data.get("data", data)` pattern in `calendar.py` already handles one response format variation. For a larger breaking change:
+
+1. **Versioned header**: The `"cal-api-version": "2024-08-13"` header pins Orbit to a specific API version. Cal.com maintains old versions for backward compatibility.
+
+2. **Test suite**: Unit tests with mocked responses (`responses` or `httpx` mock transport) would catch response format changes without hitting production.
+
+3. **Graceful degradation**: If `booking.get("uid")` returns `None` (key renamed), `execution_result` would be `{"booking_uid": None, "status": "created", ...}`. This is a failure mode to monitor but not a crash.
+
+4. **Fix process**: Update `calendar.py` to use the new field names, update the `"cal-api-version"` header to the new version, run integration tests.
+
+The key is that `calendar.py` is isolated in `tools/` — changes are localized to one file.
+
+### Challenge 7: Testing Without Real APIs
+
+**Examiner:** "How would you test this system without real Gmail, Cal.com, and Slack accounts?"
+
+**Defense:** Three levels of testing:
+
+**Unit tests** (no real APIs): Mock all external calls:
+```python
+# Test send_email
+from unittest.mock import patch, MagicMock
+with patch("tools.gmail.build") as mock_build, \
+     patch("tools.gmail.get_credentials", return_value=MagicMock()):
+    mock_build.return_value.users().messages().send().execute.return_value = {"id": "test123"}
+    result = send_email("test@test.com", "Subj", "Body")
+    assert result["status"] == "sent"
+```
+
+**Integration tests** (test accounts): Use a Gmail test account, a Cal.com sandbox, a Slack test workspace. Run actual API calls but against non-production resources.
+
+**G3 and M6 tests** (pure Python, no API): Test validation logic independently:
+```python
+assert check_action_payload("gmail.send_email", {"to": "root@localhost", "subject": "x", "body": "y"}).passed == False
+assert GmailSendSchema(**{"to": "test@test.com", "subject": "Hi", "body": "Hello"}).to == "test@test.com"
+```
+
+**End-to-end tests**: Use `httpx.AsyncClient` with `app` from `main.py` to test the FastAPI endpoints with an in-memory test database (`TEST_DATABASE_URL`).
+
+### Challenge 8: When a Tool Call Fails Mid-Execution
+
+**Examiner:** "What if send_email authenticates successfully but the Gmail API returns 403 Forbidden?"
+
+**Defense:** `HttpError 403` is raised by `service.users().messages().send(...).execute()`. No catch in `send_email`. Propagates to `_execute_tool`'s `except Exception as e`. `execution_result = {"status": "failed", "error": "HttpError 403 ..." }`. `final_status = "failed"`. `update_action_status(action_id, "failed")` is called. `insert_decision` with `execution_result={"status": "failed", ...}` is inserted.
+
+The action shows as `failed` in the UI. A 403 typically means: missing Gmail scope (fix: re-authorize with correct scopes), revoked credentials (fix: regenerate refresh token), or domain admin blocked Gmail API (fix: admin console). The error message in `execution_result` tells the user what happened.
+
+Critically: the `decisions` table has a record. The action is marked `failed` but auditable. There is no silent failure.
+
+### Challenge 9: What Is the C3 Pattern and Why?
+
+**Examiner:** "Explain C3 specifically — why was it named and what problem does it solve?"
+
+**Defense:** C3 refers to the third design decision in the Capstone's change log (the `Changes.md` file tracks decisions numbered C1, C2, C3, etc.). The specific problem C3 solved:
+
+**Before C3**: The tool dispatch might have stored function references in state or imported tools at module level. LangGraph's `MemorySaver` checkpointer serializes `AgentState` to JSON. Python function objects are not JSON-serializable. When the graph tried to checkpoint state containing function references, it crashed with a serialization error.
+
+**After C3**: All function references are replaced with string identifiers (`"gmail.send_email"`). The actual functions are imported only when `_get_handler(action_type)` is called — at execution time, outside the graph, in the REST endpoint. The `if action_type == "gmail.send_email": from tools.gmail import send_email` pattern ensures the import happens lazily.
+
+The name "C3" is internal shorthand; the full description is "lazy dispatch via string action_type." The pattern is standard Python for breaking circular imports and is related to the Command Pattern in object-oriented design: an action is described by a data object (the string + payload), and the handler is resolved separately from the description.
+
+---
+
+*End of Jash's Viva Preparation Guide — Orbit AI Tool Execution & Integrations*
+*Total coverage: tools/gmail.py, tools/calendar.py, tools/slack.py, tools/auth.py, models.py (action schemas), routers/actions.py (C3, M6, M7, H4, H5), agents/planning.py (ACTIONS_SCHEMA, G3, H10), agents/tool_router.py, agents/guardrails.py (G3), memory/db.py (H5, H6, H4 partial unique index)*
