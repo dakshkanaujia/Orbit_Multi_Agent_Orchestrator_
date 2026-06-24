@@ -1,28 +1,28 @@
 # Orbit AI — Commit Assignment Plan
 
-> 4 contributors · backend commits sequenced Jun 23–24 · frontend pushed last as one commit
+> 4 contributors · repo created Jun 24 7:00 PM IST · all commits Jun 24, 8:00 PM → 10:00 PM IST
 
 ---
 
 ## Commit Order
 
 ```
-Abhay (Jun 23, 10:00 AM) → Utkarsh (Jun 23, 2:30 PM) → Daksh (Jun 23, 7:00 PM) → Jash (Jun 24, 10:30 AM) → Frontend (Jun 24, 4:00 PM)
+Abhay (8:00 PM) → Utkarsh (8:30 PM) → Daksh (9:00 PM) → Jash (9:30 PM) → Frontend (10:00 PM)
 ```
 
 | Step | Person | Time (IST) | Domain |
 |------|--------|------------|--------|
-| 1 | **Abhay** | Jun 23, 10:00 AM | Guardrails, Docker, infra setup |
-| 2 | **Utkarsh** | Jun 23, 2:30 PM | Memory layer, DB, retrieval |
-| 3 | **Daksh** | Jun 23, 7:00 PM | LangGraph orchestration, agents, SSE |
-| 4 | **Jash** | Jun 24, 10:30 AM | Tools, schemas, action execution |
-| 5 | **Frontend** | Jun 24, 4:00 PM | Entire `frontend/` pushed as one commit |
+| 1 | **Abhay** | Jun 24, 8:00 PM | Guardrails, Docker, infra setup |
+| 2 | **Utkarsh** | Jun 24, 8:30 PM | Memory layer, DB, retrieval |
+| 3 | **Daksh** | Jun 24, 9:00 PM | LangGraph orchestration, agents, SSE |
+| 4 | **Jash** | Jun 24, 9:30 PM | Tools, schemas, action execution |
+| 5 | **Frontend** | Jun 24, 10:00 PM | Entire `frontend/` pushed as one commit |
 
 ---
 
 ## Step 1 — Abhay
 
-**Jun 23, 2026 · 10:00 AM IST**
+**Jun 24, 2026 · 8:00 PM IST**
 
 ### Files
 
@@ -47,8 +47,8 @@ git add backend/agents/guardrails.py \
         backend/__init__.py \
         backend/routers/__init__.py
 
-GIT_AUTHOR_DATE="2026-06-23 10:00:00 +0530" \
-GIT_COMMITTER_DATE="2026-06-23 10:00:00 +0530" \
+GIT_AUTHOR_DATE="2026-06-24 20:00:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-24 20:00:00 +0530" \
 git commit -m "feat: add guardrails stack (G0-G3), docker-compose, and project setup
 
 - G0: length check, G1: regex injection scan, G2: LLM safety (fail-open), G3: payload policy
@@ -62,7 +62,7 @@ git push origin main
 
 ## Step 2 — Utkarsh
 
-**Jun 23, 2026 · 2:30 PM IST**
+**Jun 24, 2026 · 8:30 PM IST**
 
 ### Files
 
@@ -89,8 +89,8 @@ git add backend/memory/db.py \
         backend/routers/items.py \
         backend/routers/search.py
 
-GIT_AUTHOR_DATE="2026-06-23 14:30:00 +0530" \
-GIT_COMMITTER_DATE="2026-06-23 14:30:00 +0530" \
+GIT_AUTHOR_DATE="2026-06-24 20:30:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-24 20:30:00 +0530" \
 git commit -m "feat: add memory layer — asyncpg pool, pgvector retrieval, memory agent
 
 - db.py: connection pool (min=2, max=10), all CRUD, soft deletes
@@ -105,7 +105,7 @@ git push origin main
 
 ## Step 3 — Daksh
 
-**Jun 23, 2026 · 7:00 PM IST**
+**Jun 24, 2026 · 9:00 PM IST**
 
 ### Files
 
@@ -138,8 +138,8 @@ git add backend/graph.py \
         backend/agents/approval.py \
         backend/agents/__init__.py
 
-GIT_AUTHOR_DATE="2026-06-23 19:00:00 +0530" \
-GIT_COMMITTER_DATE="2026-06-23 19:00:00 +0530" \
+GIT_AUTHOR_DATE="2026-06-24 21:00:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-24 21:00:00 +0530" \
 git commit -m "feat: add LangGraph orchestration — StateGraph, 7 agents, SSE streaming
 
 - graph.py: StateGraph with interrupt_before=['approval'], MemorySaver checkpointing
@@ -155,7 +155,7 @@ git push origin main
 
 ## Step 4 — Jash
 
-**Jun 24, 2026 · 10:30 AM IST**
+**Jun 24, 2026 · 9:30 PM IST**
 
 ### Files
 
@@ -186,8 +186,8 @@ git add backend/tools/gmail.py \
         backend/routers/actions.py \
         get_google_token.py
 
-GIT_AUTHOR_DATE="2026-06-24 10:30:00 +0530" \
-GIT_COMMITTER_DATE="2026-06-24 10:30:00 +0530" \
+GIT_AUTHOR_DATE="2026-06-24 21:30:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-24 21:30:00 +0530" \
 git commit -m "feat: add tool integrations and action execution layer
 
 - tools: Gmail (OAuth2+MIME), Cal.com REST, Slack SDK, Google auth refresh
@@ -202,7 +202,7 @@ git push origin main
 
 ## Step 5 — Frontend (pushed last)
 
-**Jun 24, 2026 · 4:00 PM IST**
+**Jun 24, 2026 · 10:00 PM IST**
 
 All frontend code pushed as a single commit by any one team member.
 
@@ -241,8 +241,8 @@ git pull origin main
 
 git add frontend/
 
-GIT_AUTHOR_DATE="2026-06-24 16:00:00 +0530" \
-GIT_COMMITTER_DATE="2026-06-24 16:00:00 +0530" \
+GIT_AUTHOR_DATE="2026-06-24 22:00:00 +0530" \
+GIT_COMMITTER_DATE="2026-06-24 22:00:00 +0530" \
 git commit -m "feat: add Next.js frontend — dashboard, workspace, approvals, search, hub
 
 - layout + nav with active link state
