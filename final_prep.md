@@ -57,7 +57,28 @@ User Input (text / PDF / image)
 
 ---
 
-## LangGraph — How It's Wired
+## LangGraph — Theory & How It's Wired
+
+### What is LangGraph?
+
+LangGraph is a library for building **stateful, multi-actor applications** with LLMs. It models the workflow as a directed graph where:
+- **Nodes** are agents or functions — each does one job
+- **Edges** define the order of execution
+- **State** is a shared TypedDict passed between all nodes
+- **Checkpoints** allow the graph to pause and resume mid-execution
+
+LangGraph's key advantage over simple chaining (like LangChain LCEL) is that it supports **cycles, conditional branching, and human interrupts** — making it suitable for agentic workflows where the next step depends on what happened in the previous one.
+
+### Why a Graph, Not a Chain?
+
+A plain chain runs A → B → C with no ability to branch or pause. Orbit needs:
+1. **Conditional routing** after intent detection (clarification needed? → halt)
+2. **Human-in-the-loop** pause before execution
+3. **Resumable state** — the graph persists checkpoint between the pause and resume
+
+LangGraph provides all three natively.
+
+### The StateGraph (Orbit's Wiring)
 
 ```python
 builder = StateGraph(AgentState)
@@ -91,14 +112,66 @@ builder.add_edge("approval", END)
 app = builder.compile(checkpointer=MemorySaver(), interrupt_before=["approval"])
 ```
 
-**Why `interrupt_before=["approval"]`?**  
-The graph pauses after tool_router finishes. The human sees proposed actions on the frontend, then calls `/approve` or `/reject` via REST API. The tool actually executes there — not inside the graph.
+### Key LangGraph Concepts in Orbit
+
+| Concept | What It Is | How Orbit Uses It |
+|---------|-----------|------------------|
+| `StateGraph` | Graph where every node reads/writes shared state | All 7 agents share `AgentState` |
+| `add_conditional_edges` | Route to different next nodes based on state | After intent: halt if unclear, else continue |
+| `interrupt_before` | Pause graph execution before a named node | Pauses before `approval` for human review |
+| `MemorySaver` | In-memory checkpointer — saves state at each step | Stores graph state between pause and resume |
+| `thread_id` | Key that identifies a conversation/run | `run_id` links the graph to the DB and LangSmith |
+| `astream(stream_mode="updates")` | Async generator — yields state after each node | Drives the frontend live pipeline strip via SSE |
+
+**Why `interrupt_before=["approval"]`?**
+The graph pauses after `tool_router` finishes — the state is checkpointed. The human sees proposed actions on the frontend, then calls `/approve` or `/reject` via REST API. The tool executes there — not inside the graph. This means tool execution is fully decoupled from graph execution, making each independently testable.
+
+---
+
+## Multi-Agent Design Principles (Theory)
+
+### Why Multiple Agents?
+
+A single agent given all tasks (OCR + entity extraction + intent classification + action planning + validation) would face:
+- **Context overload** — 10,000+ token prompts degrade LLM reasoning quality
+- **Single point of failure** — one error in OCR corrupts everything downstream
+- **No separation of concerns** — impossible to test or improve one step without affecting others
+
+Multi-agent design solves this by assigning **one agent = one job = one prompt = one failure mode**.
+
+### Agent Design Patterns Used
+
+| Pattern | Definition | Where in Orbit |
+|---------|-----------|---------------|
+| **Sequential pipeline** | Agents run one after another; each feeds the next | understanding → intent → memory → planning → tool_router |
+| **Conditional branching** | Route to different agents based on state | intent → clarification_halt OR memory |
+| **Human-in-the-loop** | Graph pauses for human decision | Interrupt before approval node |
+| **Shared state bus** | All agents read/write one shared object | AgentState TypedDict |
+| **Fail-open safety** | Errors in non-critical agents allow continuation | G2 LLM guardrail catches exceptions and passes |
+| **Structured output** | All LLM calls forced to return JSON via tool_use | Prevents free-text responses from breaking parsing |
+
+### Sequential vs Parallel Agents
+
+Orbit uses a **purely sequential pipeline**. Each agent strictly depends on the previous agent's output:
+- `memory` needs `extracted_items` from `intent`
+- `planning` needs `capture_id` from `memory`
+- `tool_router` needs `actions` from `planning`
+
+Parallelizing these would break the dependency chain. The trade-off is latency (sequential is slower) vs correctness (parallel would require independent inputs).
+
+### Deterministic Routing
+
+Orbit's conditional edge uses a **deterministic lambda** — not an LLM-decided router:
+```python
+lambda state: "clarification_halt" if state.get("clarification_needed") else "memory"
+```
+This is a deliberate choice. LLM-based routing (like in CrewAI) is non-deterministic — the same input can route differently on different runs. For a production workflow that moves money or sends emails, determinism is non-negotiable.
 
 ---
 
 ## Shared State (AgentState)
 
-Every agent reads from and writes to one shared TypedDict:
+Every agent reads from and writes to one shared TypedDict — the **state bus**:
 
 ```python
 class AgentState(TypedDict):
@@ -118,38 +191,10 @@ class AgentState(TypedDict):
     trace: list                 # per-agent summary entries
 ```
 
-Each agent returns `{**state, new_field: value}` — spreads existing state and adds its outputs.
+**Why TypedDict?**
+LangGraph checkpoints state as JSON. TypedDict is JSON-serializable without `.dict()` calls, has no constructor overhead, and works with LangGraph's MemorySaver directly. Pydantic models would require serialization/deserialization at every checkpoint.
 
----
-
-## Database Schema (5 tables)
-
-```
-captures          extracted_items         actions
-─────────         ───────────────         ───────
-id (UUID)         id (UUID)               id (UUID)
-run_id            capture_id ──FK──►      extracted_item_id ──FK──►
-modality          item_type               action_type
-raw_content       title                   payload (JSONB)
-embedding         description             requires_approval
-(vector 384)      confidence_score        status
-metadata          urgency_score           depends_on_action_id
-deleted_at        deadline
-                  planning_status
-                  embedding (vector 384)
-
-decisions                   runs
-─────────                   ────
-id (UUID)                   id (UUID)
-action_id ──FK──►           capture_id
-decision                    status
-edited_payload              trace (JSONB)
-final_payload               created_at
-execution_result
-decided_at
-```
-
-**Key constraint:** `UNIQUE INDEX on decisions(action_id) WHERE action_id IS NOT NULL` — prevents double-approving the same action.
+Each agent returns `{**state, new_field: value}` — spreads existing state and adds its outputs. No agent modifies previous agents' fields.
 
 ---
 
@@ -168,7 +213,7 @@ Incoming text
 [G2] LLM safety check      → Claude Haiku classifies:
      │                        safe / prompt_injection / harmful_request /
      ▼                        data_exfiltration / spam_campaign / self_harm
-     │                        @traceable in LangSmith. FAIL-OPEN on error.
+     │                        Traced in LangSmith. FAIL-OPEN on error.
      ▼
 [G3] Payload policy        → Applied in planning + again at approval:
                               Gmail: email regex, blocked domains, body ≤ 5000
@@ -176,7 +221,7 @@ Incoming text
                               Calendar: ISO 8601 datetime required
 ```
 
-**Fail-open** means G2 API errors never block users — transient failures pass through.
+**Fail-open** means G2 API errors never block users — transient failures pass through. This is intentional: a transient Anthropic API error is far more likely than a genuine spam campaign.
 
 ---
 
@@ -192,19 +237,16 @@ Graph pauses at approval checkpoint
      ▼            ▼            ▼
   /approve     /reject       /edit
      │                         │
-  G3 check                  M6 Pydantic
+  G3 check                  Pydantic
   pre-execute               validation first,
      │                      then G3 check,
      ▼                      then execute
   _execute_tool()
      │
   Gmail / Cal.com / Slack
-     │
-  DB: insert decision row
-  {edited_payload, final_payload, execution_result}
 ```
 
-Concurrent requests handled by `SELECT ... FOR UPDATE` inside a transaction (row-level lock).
+This pattern is called **"human-in-the-loop with interrupt"** — the graph doesn't resume after approval. Instead, execution is handed off entirely to the REST layer. This separates orchestration (LangGraph) from execution (FastAPI), making each independently deployable and testable.
 
 ---
 
@@ -217,6 +259,10 @@ Concurrent requests handled by `SELECT ... FOR UPDATE` inside a transaction (row
   2. Fallback to `captures` for any uncovered content
 - **Query:** `SELECT *, 1 - (embedding <=> $query) AS score FROM extracted_items ORDER BY score DESC`
 
+**Why local embeddings?** No API cost, no rate limits, no data leaving the server. 384 dimensions is sufficient for semantic similarity of short action descriptions.
+
+**Why HNSW over IVFFlat?** IVFFlat requires a training phase (clustering). HNSW builds incrementally — works at any table size including 0 rows, and gives better recall at query time.
+
 ---
 
 ## LangSmith Observability
@@ -228,24 +274,22 @@ config = {
     "metadata": {"orbit_run_id": run_id, "input_type": "text"},
     "tags": ["orbit"],
 }
-# Every LangGraph node appears as a child span automatically
-# when LANGCHAIN_TRACING_V2=true in .env
 ```
 
-G2 guardrail has `@traceable(run_type="chain", name="content-safety-check")` — appears as a named span in LangSmith even though it runs before the graph.
+Every LangGraph node appears as a child span automatically when `LANGCHAIN_TRACING_V2=true`. The G2 guardrail has `@traceable` — it appears as a named span in LangSmith even though it runs before the graph starts.
 
 ---
 
 ## Tools
 
-| Tool | File | API Used | Returns |
-|------|------|----------|---------|
-| `gmail.send_email` | tools/gmail.py | Google Gmail API v1 | `{message_id, to, subject, status}` |
-| `calendar.create_booking` | tools/calendar.py | Cal.com v2 REST | `{booking_uid, status, start}` |
-| `slack.send_reminder` | tools/slack.py | Slack SDK | `{ts, channel, status}` |
-| `slack.send_summary` | tools/slack.py | Slack SDK (mrkdwn blocks) | `{ts, channel, status}` |
+| Tool | API Used | Returns |
+|------|----------|---------|
+| `gmail.send_email` | Google Gmail API v1 | `{message_id, to, subject, status}` |
+| `calendar.create_booking` | Cal.com v2 REST | `{booking_uid, status, start}` |
+| `slack.send_reminder` | Slack SDK | `{ts, channel, status}` |
+| `slack.send_summary` | Slack SDK (mrkdwn blocks) | `{ts, channel, status}` |
 
-**Lazy dispatch (C3):** `_get_handler(action_type)` resolves the handler at execution time via local imports. No function references stored in graph state — keeps state JSON-serializable.
+**Lazy dispatch (C3):** `_get_handler(action_type)` resolves the handler at execution time via local imports. No function references stored in graph state — keeps state JSON-serializable for LangGraph checkpointing.
 
 ---
 
@@ -253,70 +297,111 @@ G2 guardrail has `@traceable(run_type="chain", name="content-safety-check")` —
 
 ---
 
-### Daksh — Agent Orchestration (LangGraph Control Flow)
+### Daksh — Agent Orchestration & LangGraph Control Flow
 
-**What he built:** The entire `graph.py` — StateGraph wiring, node registration, edge definitions, conditional routing, interrupt mechanism, and SSE streaming integration.
+**Domain:** How agents are connected, sequenced, and controlled.
 
-**Key contributions:**
-- `StateGraph(AgentState)` with 7 nodes and 6 edges
-- Conditional edge after intent: routes to `clarification_halt` or `memory` based on `clarification_needed`
-- `interrupt_before=["approval"]` — pauses graph for human decision
-- `astream(stream_mode="updates")` driving the frontend pipeline strip via SSE
-- `run_id` as `thread_id` in config — links graph execution to LangSmith and DB
+**What he built:**
+The entire `graph.py` — StateGraph wiring, node registration, edge definitions, conditional routing, interrupt mechanism, and SSE streaming integration.
 
-**Why LangGraph?** Explicit graph with typed state, built-in checkpointing, resumable execution, and deterministic routing. Unlike CrewAI (LLM-decided routing) or AutoGen (conversational), Orbit needs a strict sequential pipeline with one conditional branch.
+**Conceptual ownership:**
+- **Graph topology design** — deciding which agents exist, in what order, and what triggers a branch. This is the core architectural decision: 7 nodes, 6 deterministic edges, 1 conditional edge.
+- **Conditional routing logic** — after the intent agent, the graph either halts (clarification needed) or continues (all items are clear). This is implemented as a deterministic lambda over state, not an LLM decision — a deliberate choice for predictability.
+- **interrupt_before mechanism** — understanding that `interrupt_before=["approval"]` doesn't pause inside the approval node; it prevents the node from starting at all. The graph checkpoints, stops, and waits for an external signal (the REST endpoint resuming it).
+- **SSE streaming** — `astream(stream_mode="updates")` yields state deltas after each node. The frontend consumes these as server-sent events to show a live pipeline strip.
+- **run_id as thread_id** — the single string that links the graph checkpoint, the DB row, and the LangSmith trace. Without this, debugging a failed pipeline run across three systems would be impossible.
 
-**Key design decision:** Sequential pipeline (not parallel) because each node strictly depends on the previous node's output — understanding feeds intent, intent feeds memory, etc.
+**Key design decisions:**
+- Sequential pipeline (not parallel) — because each agent strictly depends on the previous agent's output
+- Deterministic routing (lambda, not LLM) — predictable, testable, production-safe
+- `interrupt_before` over `interrupt_after` — gives human a chance to see proposed actions before any DB writes for execution happen
 
----
-
-### Utkarsh — State & Memory Systems
-
-**What he built:** `AgentState` TypedDict, all 5 DB tables (schema + migrations), `asyncpg` connection pool, `memory_agent`, and the `retrieval.py` semantic search module.
-
-**Key contributions:**
-- `AgentState` TypedDict with 17 fields — the communication bus for all agents
-- `memory/db.py`: asyncpg pool (min=2, max=10), JSON/JSONB codecs, all CRUD operations, soft deletes
-- `memory_agent`: embeds capture + each item, inserts to PostgreSQL, H2 assertion (`assert len(item_ids) == len(items)`)
-- HNSW indexes on both `captures.embedding` and `extracted_items.embedding`
-- Two-level retrieval: items by cosine similarity → captures as fallback
-
-**Why pgvector?** No extra infrastructure — vector search lives in the same PostgreSQL instance as relational data. SQL joins and transactional consistency come free.
-
-**Why TypedDict for state (not Pydantic)?** LangGraph expects dict-like objects. TypedDict is JSON-serializable without `.dict()` calls, has no `__init__` overhead, and checkpoints cleanly with MemorySaver.
+**Likely viva questions:**
+- What is a StateGraph and how does it differ from a simple LangChain chain?
+- How does `interrupt_before` work mechanically — what does "checkpoint" mean here?
+- Why not let an LLM decide routing?
+- What would happen if you used `interrupt_after=["tool_router"]` instead?
 
 ---
 
-### Jash — Tool Execution & Integrations
+### Utkarsh — Shared State & Memory Systems
 
-**What he built:** All 4 tool files (`gmail.py`, `calendar.py`, `slack.py`, `auth.py`), all Pydantic action schemas in `models.py`, the C3 lazy dispatch pattern in `actions.py`, and M6 payload validation.
+**Domain:** How agents communicate, how data persists, how past captures are recalled.
 
-**Key contributions:**
-- 4 external API integrations: Gmail (OAuth2 + MIME), Cal.com (REST), Slack (SDK), Google Auth (refresh token)
-- `ACTION_SCHEMAS` dict mapping action_type strings → Pydantic classes (CalComBookingSchema, GmailSendSchema, SlackReminderSchema, SlackSummarySchema)
-- `_get_handler()` + `_execute_tool()` — C3 lazy dispatch with full error wrapping
-- M6 validation: `schema_cls(**body.edited_payload)` before any edited payload executes
-- H5 audit split: `edited_payload`, `final_payload`, `execution_result` as separate DB columns
-- Structured output pattern (H10): all LLM calls use `tool_choice={"type":"tool"}` to force JSON
+**What he built:**
+`AgentState` TypedDict, the 5-table DB schema, the `memory_agent`, and the `retrieval.py` semantic search module.
 
-**Why lazy dispatch?** Storing callable objects in `AgentState` would break LangGraph's JSON checkpointing. Strings serialize cleanly; handlers are resolved at execution time.
+**Conceptual ownership:**
+- **AgentState as the communication bus** — the 17-field TypedDict is the single source of truth for the entire pipeline. Every agent reads from it and writes back to it. The design ensures no agent modifies another agent's fields — write-once semantics prevent silent overwrites.
+- **Why TypedDict over Pydantic** — LangGraph checkpoints state as JSON. TypedDict is JSON-serializable by default, has no constructor overhead, and works with MemorySaver directly. Pydantic models require `.dict()` calls and custom serializers at every checkpoint.
+- **Two-level semantic retrieval** — extracteditem-level search (granular) with capture-level fallback (broad). This means a query for "email about deadline" first finds the specific item, then falls back to the full document if no specific item matches closely enough.
+- **HNSW indexing** — hash-navigable small world graphs allow approximate nearest-neighbor search in O(log n) time. Unlike IVFFlat, HNSW doesn't need a training phase, so it works even when the table is empty.
+- **Soft deletes** — `deleted_at` column instead of physical DELETE. Allows audit trails, undo operations, and prevents FK violations if related rows still exist.
+
+**Key design decisions:**
+- Single shared state object for all agents (not message passing between agents)
+- Local embeddings (sentence-transformers) to avoid API cost and data egress
+- Two-level retrieval: item → capture fallback ensures no query returns empty unless the DB is genuinely empty
+
+**Likely viva questions:**
+- Why does every agent receive the full state instead of just what it needs?
+- What is a vector embedding and why is cosine similarity used over Euclidean distance?
+- What is HNSW and why is it better than a brute-force search at scale?
+- What happens if the memory agent fails to write? Does the graph continue?
+
+---
+
+### Jash — Tool Execution & External Integrations
+
+**Domain:** How proposed actions get validated, dispatched, and executed against real external APIs.
+
+**What he built:**
+All 4 tool files (Gmail, Calendar, Slack, Auth), all Pydantic action schemas, the C3 lazy dispatch pattern in `actions.py`, and M6 payload validation at the edit endpoint.
+
+**Conceptual ownership:**
+- **C3 Lazy dispatch pattern** — action types are stored in AgentState as plain strings (`"gmail.send_email"`). The actual function handler is resolved at execution time via `_get_handler()`. This is necessary because storing callable objects in state would break LangGraph's JSON checkpointing — functions cannot be serialized to JSON. Strings can.
+- **M6 Pydantic validation** — before executing an edited payload, it's validated against a schema class: `ACTION_SCHEMAS.get(action_type)(**body.edited_payload)`. This catches type errors, missing fields, and invalid values before they reach the external API.
+- **H5 audit split** — three separate DB columns: `edited_payload` (what the human changed), `final_payload` (what was actually sent), `execution_result` (what the API returned). This makes auditing and debugging each phase independently possible.
+- **H10 structured output** — all LLM calls use `tool_choice={"type":"tool"}` to force the model to call a tool with a defined JSON schema. This prevents the LLM from returning free text that would fail JSON parsing downstream.
+- **Tool abstraction** — each tool returns a consistent dict structure. The approval router doesn't know which external API was called — it only sees `{status: "sent", ...}`. This makes swapping tools (e.g. replacing Cal.com with Google Calendar) a single-file change.
+
+**Key design decisions:**
+- Lazy dispatch over storing function references — keeps state JSON-serializable
+- Pydantic schemas per action type — catches bad edits before API calls, not after
+- Unified result format — every tool returns `{status, ...}` regardless of underlying API
+
+**Likely viva questions:**
+- Why can't you store function references in LangGraph state?
+- What is the C3 pattern and when would you need it?
+- What happens if the Gmail API call fails — what does the user see?
+- Why validate the payload twice (at edit AND at approval)?
 
 ---
 
 ### Abhay — Evaluation, Guardrails & Reliability
 
-**What he built:** `agents/guardrails.py` (G0-G3 system), LangSmith integration config, human-in-the-loop approval endpoints with H4 idempotency, and the evaluation framework.
+**Domain:** How the system defends against bad input, ensures safe execution, and remains observable.
 
-**Key contributions:**
-- G0-G3 guardrail stack: length → regex injection → LLM classification → payload policy
-- `@traceable(run_type="chain", name="content-safety-check")` on G2 for LangSmith visibility
-- Fail-open design: G2 API errors never block users
-- H4 idempotency: `SELECT ... FOR UPDATE` in transaction + partial unique index on `decisions(action_id)`
-- M7 row-level locking: prevents concurrent double-execution of the same action
-- LangSmith config in both capture endpoints: `run_name`, `metadata`, `tags`
-- Double G3 application: at planning time (pre-store) + at approval time (pre-execute)
+**What he built:**
+`agents/guardrails.py` (G0-G3 system), LangSmith tracing integration, human-in-the-loop idempotency (H4), and the evaluation framework.
 
-**Why fail-open on G2?** A transient Anthropic API error is far more likely than a genuine spam campaign. Blocking all users due to an API outage would break the product. False negatives in G2 are caught by G3 and human approval anyway.
+**Conceptual ownership:**
+- **Layered guardrail design** — G0-G3 are not redundant; they're a defense-in-depth stack. G0 catches obvious garbage in microseconds. G1 catches known injection strings without an API call. G2 uses LLM classification for subtle attacks. G3 validates the action payload immediately before execution. Each layer has a different cost/coverage trade-off.
+- **Fail-open on G2** — when the Claude Haiku API call inside G2 throws an exception, the guardrail returns `passed=True`. This is intentional: a transient Anthropic API outage should never block legitimate users. False negatives in G2 are caught by G3 (payload validation) and by the human review step anyway.
+- **H4 idempotency** — double-approving an action must be prevented. The solution uses two layers: (1) `SELECT ... FOR UPDATE` at the application level — locks the row inside a transaction so concurrent requests queue, not race; (2) a partial unique index at the database level — `UNIQUE INDEX on decisions(action_id) WHERE action_id IS NOT NULL` — a second insert with the same `action_id` fails at the DB layer even if the application-level check was somehow bypassed.
+- **G3 double application** — G3 runs at planning time (before storing proposed actions) and again at approval time (before executing). This prevents a scenario where a valid-at-planning payload becomes invalid by the time a human approves it hours later (e.g., domain was added to blocklist in between).
+- **LangSmith tracing** — the `run_name`, `metadata`, and `tags` in the graph config create structured, searchable traces. `@traceable` on G2 means the guardrail check appears as a named span even though it runs outside the graph, giving a complete picture of the pipeline in one view.
+
+**Key design decisions:**
+- Fail-open (not fail-closed) on G2 — uptime takes priority over edge-case safety
+- Two-layer idempotency (app + DB) — belt-and-suspenders for a write-once operation
+- G3 runs twice — because the world changes between planning and execution
+
+**Likely viva questions:**
+- What is fail-open vs fail-closed? When would you choose each?
+- How does `SELECT FOR UPDATE` prevent double-execution?
+- What is the partial unique index on `decisions` and why is it partial (not full)?
+- What does `@traceable` add beyond LangGraph's automatic tracing?
 
 ---
 
@@ -342,36 +427,40 @@ G2 guardrail has `@traceable(run_type="chain", name="content-safety-check")` —
 **Input:** _"Email Sarah at sarah@company.com that the project deadline is moved to July 5th"_
 
 1. **understanding** → entities: `{people: ["Sarah"], dates: ["July 5th"], emails: ["sarah@company.com"]}`
-2. **intent** → 1 item: `{type: "communication", title: "Email Sarah about deadline", urgency: 0.7}`
-3. **memory** → saved to DB, `capture_id` and `item_id` returned
-4. **planning** → action: `{action_type: "gmail.send_email", payload: {to: "sarah@company.com", subject: "Project deadline update", body: "..."}}`
-5. **tool_router** → validates action_type is in VALID_ACTION_TYPES ✓
-6. **Graph pauses** at approval checkpoint
-7. User clicks **Approve** in frontend
-8. `POST /api/actions/{id}/approve` → G3 validates email → `send_email()` called → email sent
-9. Decision recorded: `{approved, final_payload, execution_result: {message_id: "...", status: "sent"}}`
+2. **intent** → 1 item: `{type: "communication", title: "Email Sarah about deadline", urgency: 0.7}` — `clarification_needed: false`
+3. **Conditional edge routes to memory** (not clarification_halt)
+4. **memory** → saved to DB, `capture_id` and `item_id` written back to state
+5. **planning** → action: `{action_type: "gmail.send_email", payload: {to: "sarah@company.com", subject: "Project deadline update", body: "..."}}`
+6. **tool_router** → validates `action_type` is in `VALID_ACTION_TYPES` ✓
+7. **Graph checkpoints and pauses** — `interrupt_before=["approval"]` fires
+8. User clicks **Approve** in frontend
+9. `POST /api/actions/{id}/approve` → G3 validates email → `send_email()` called → email sent
+10. Decision recorded: `{approved, final_payload, execution_result: {message_id: "...", status: "sent"}}`
 
 ---
 
 ## Viva Quick-Fire Answers
 
-**Q: Why multiple agents instead of one?**  
-Each agent has one job, one prompt, one failure mode. A single agent doing OCR + entity extraction + item classification + action planning + validation is a 10,000-token context nightmare that hallucinates on complex documents.
+**Q: Why multiple agents instead of one?**
+Each agent has one job, one prompt, one failure mode. A single agent doing OCR + entity extraction + item classification + action planning + validation is a 10,000-token context nightmare that hallucinates on complex documents. Separation also means each agent can be improved, swapped, or tested independently.
 
-**Q: Why LangGraph over CrewAI?**  
-CrewAI uses LLM-decided routing — non-deterministic and hard to test. LangGraph gives an explicit graph with typed state, which is what a sequential pipeline with one conditional branch needs.
+**Q: Why LangGraph over CrewAI or AutoGen?**
+CrewAI uses LLM-decided routing — non-deterministic and hard to test. AutoGen is conversational (agents talk to each other as messages). LangGraph gives an explicit graph with typed state and deterministic routing, which is what a sequential pipeline with one conditional branch needs. You can read the graph definition and know exactly what will happen.
 
-**Q: What happens if the understanding agent fails?**  
-LangGraph propagates the exception to the caller. The `try/except` in `captures.py` catches it, calls `db.update_run(run_id, "failed", ...)`, and returns HTTP 500.
+**Q: What does `interrupt_before` actually do?**
+After `tool_router` completes, LangGraph checkpoints the full state keyed by `thread_id`, then stops before executing the `approval` node. MemorySaver holds this checkpoint. The graph does NOT resume — execution continues in the REST endpoint instead, which calls `_execute_tool()` directly.
 
-**Q: How is concurrent double-approval prevented?**  
-`SELECT ... FOR UPDATE` locks the action row inside a transaction. A second request trying to lock the same row blocks until the first transaction commits, then sees the updated status and returns 409.
+**Q: How is concurrent double-approval prevented?**
+Two layers: (1) `SELECT ... FOR UPDATE` locks the action row inside a transaction — a second request trying to lock the same row blocks until the first commits, then sees the updated status and returns 409. (2) A partial unique index on `decisions(action_id)` at the DB level means even if the app-level lock was bypassed, the insert would fail.
 
-**Q: What does `interrupt_before` actually do?**  
-The graph checkpoints state after `tool_router` completes, then stops before executing the `approval` node. MemorySaver stores this checkpoint keyed by `thread_id`. The graph does NOT resume — execution continues in the REST endpoint instead.
+**Q: What is the C3 pattern?**
+Lazy tool dispatch: only string action types (e.g. `"gmail.send_email"`) are stored in AgentState. The actual handler function is resolved at execution time via `_get_handler()`. This keeps state JSON-serializable for LangGraph checkpointing — you can't serialize a Python function to JSON.
 
-**Q: Why HNSW over IVFFlat for vectors?**  
-IVFFlat requires a training phase (needs enough data to cluster). HNSW builds incrementally — works at any table size including 0 rows, and gives better recall.
+**Q: Why HNSW over IVFFlat for vectors?**
+IVFFlat requires a training phase (needs enough data to cluster centroid points). HNSW builds incrementally — works at any table size including 0 rows, and gives better recall at query time.
 
-**Q: What is the C3 pattern?**  
-Lazy tool dispatch: only string action types (e.g. `"gmail.send_email"`) are stored in AgentState. The actual handler function is resolved at execution time via `_get_handler()`. This keeps state JSON-serializable for LangGraph checkpointing.
+**Q: What happens if the understanding agent fails?**
+LangGraph propagates the exception to the caller. The `try/except` in `captures.py` catches it, marks the run as failed in the DB, and returns HTTP 500. No subsequent agents run.
+
+**Q: Why is G2 fail-open instead of fail-closed?**
+A transient Anthropic API error is orders of magnitude more likely than a genuine harmful request. Fail-closed would block all users during any API hiccup. False negatives from G2 are still caught by G3 (payload policy) and by the human review step — the system has defense in depth.
